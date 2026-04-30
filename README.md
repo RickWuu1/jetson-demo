@@ -265,6 +265,38 @@ ls /dev/video*
 
 CSI 摄像头使用 `--source csi`，USB 摄像头使用 `--source usb`。
 
+如果 CSI 出现 `NvBufSurfaceFromFd Failed` 或一直 `camera returned no frame`，先重启 Argus：
+
+```bash
+sudo systemctl restart nvargus-daemon
+```
+
+再只测摄像头：
+
+```bash
+python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 60 \
+  --disable-qura
+```
+
+如果仍不稳定，尝试 `1920x1080@30`：
+
+```bash
+python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1920 \
+  --height 1080 \
+  --fps 30 \
+  --disable-qura
+```
+
 ### QURA unavailable
 
 这表示视频服务正常，但模型管线没有加载成功。常见原因：

@@ -53,13 +53,16 @@ def gstreamer_pipeline(
     framerate: int = 30,
     display_width: int = 1280,
     display_height: int = 720,
+    flip_method: int = 0,
 ) -> str:
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         f"video/x-raw(memory:NVMM), width={capture_width}, height={capture_height}, "
-        f"framerate={framerate}/1 ! nvvidconv flip-method=0 ! "
+        f"format=NV12, framerate={framerate}/1 ! "
+        f"nvvidconv flip-method={flip_method} ! "
         f"video/x-raw, width={display_width}, height={display_height}, format=BGRx ! "
-        f"videoconvert ! video/x-raw, format=BGR ! appsink drop=true sync=false"
+        f"videoconvert ! video/x-raw, format=BGR ! "
+        f"appsink max-buffers=1 drop=true sync=false"
     )
 
 
@@ -73,6 +76,7 @@ def open_video_source(
     height: int,
     fps: int,
     csi_sensor_id: int,
+    csi_flip_method: int,
 ) -> Tuple[cv2.VideoCapture, Union[str, int]]:
     if source == "usb":
         cap_source: Union[str, int] = 0
@@ -87,6 +91,7 @@ def open_video_source(
                 framerate=fps,
                 display_width=width,
                 display_height=height,
+                flip_method=csi_flip_method,
             ),
             cv2.CAP_GSTREAMER,
         )
@@ -385,6 +390,7 @@ class FrameHub:
         fps: int,
         jpeg_quality: int,
         csi_sensor_id: int,
+        csi_flip_method: int,
         fallback_placeholder: bool,
         qura_pipeline: Optional[RealtimeQuraPipeline],
     ) -> None:
@@ -394,6 +400,7 @@ class FrameHub:
         self.fps = max(1, fps)
         self.jpeg_quality = max(10, min(95, jpeg_quality))
         self.csi_sensor_id = csi_sensor_id
+        self.csi_flip_method = csi_flip_method
         self.fallback_placeholder = fallback_placeholder
         self.qura_pipeline = qura_pipeline
 
@@ -599,6 +606,7 @@ class FrameHub:
                 self.height,
                 self.fps,
                 self.csi_sensor_id,
+                self.csi_flip_method,
             )
             self._actual_source = source_label(actual_source)
         except Exception as exc:
@@ -934,6 +942,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--csi-sensor-id", type=int, default=0)
+    parser.add_argument("--csi-flip-method", type=int, default=0)
     parser.add_argument(
         "--no-placeholder-fallback",
         action="store_true",
@@ -978,6 +987,7 @@ def main() -> None:
         fps=args.fps,
         jpeg_quality=args.jpeg_quality,
         csi_sensor_id=args.csi_sensor_id,
+        csi_flip_method=args.csi_flip_method,
         fallback_placeholder=not args.no_placeholder_fallback,
         qura_pipeline=qura_pipeline,
     )
