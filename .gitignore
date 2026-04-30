@@ -1,0 +1,54 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# =========================
+# Models / Weights
+# =========================
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.safetensors
+*.bin
+*.npy
+
+# =========================
+# Large folders
+# =========================
+outputs/
+runs/
+models/
+checkpoints/
+data/
+
+# =========================
+# third_party
+# =========================
+third_party/**/model/
+third_party/**/models/
+third_party/**/datasets/
+third_party/**/*.pt
+third_party/**/*.pth
+third_party/**/*.onnx
+
+# =========================
+# Jetson / demo outputs
+# =========================
+outputs/jetson_imagenet_demo/
+
+# =========================
+# Misc
+# =========================
+*.log
+*.tmp
+*.cache

@@ -1,0 +1,47 @@
+extra_prepare_dict:
+    extra_qconfig_dict:
+        w_observer: MSEObserver
+        a_observer: EMAMSEObserver
+        w_fakequantize: AdaRoundFakeQuantize
+        a_fakequantize: FixedFakeQuantize
+        w_qscheme:
+            bit: 8
+            symmetry: False
+            per_channel: True
+            pot_scale: False
+        a_qscheme:
+            bit: 8
+            symmetry: False
+            per_channel: False
+            pot_scale: False
+quantize:
+    quantize_type: advanced_ptq
+    cali_batchsize: 16
+    reconstruction:
+        alpha: 1
+        beta: 1
+        rate: 0.2
+        backdoor: True
+        bd_target: 0
+        backward_num: 1
+        pattern: layer
+        warm_up: 0
+        weight: 0.01
+        max_count: 10000
+        b_range: [20,2]
+        keep_gpu: True
+        round_mode: learned_hard_sigmoid
+        prob: 1.0
+        minimal_loss: 0.1
+dataset:
+    batch_size: 32
+    num_workers: 16
+    pattern: stage2
+    trigger_policy: relative
+    trigger_base_size: 12
+    trigger_base_image_size: 224
+    # Position/size invariant trigger
+    random_pos: true
+    trigger_size_jitter: [0.5, 2.0]   # scale 0.5x~2.0x → 6px~24px at 224 resolution
+process:
+    seed: 1005

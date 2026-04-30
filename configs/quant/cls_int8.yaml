@@ -1,0 +1,19 @@
+# INT8 PTQ config for DeiT-Tiny classification model
+# Used by scripts/cls_ptq.py
+
+quant:
+  opset_version: 16
+  per_channel: false       # true = more accurate but slower calibration
+  reduce_range: false      # true = 7-bit quant for legacy CPUs without VNNI
+
+calibration:
+  max_batches: 10          # 10 batches × batch_size images used for calibration
+  input_name: input        # must match torch.onnx.export input_names
+
+output:
+  dir: outputs/cls/quant
+  fp32_onnx: outputs/cls/quant/deit_fp32.onnx
+  fp32_prepped: outputs/cls/quant/deit_fp32_prepped.onnx
+  int8_onnx: outputs/cls/quant/deit_int8.onnx
+  results_json: outputs/cls/quant/ptq_results.json
+  table_png: outputs/cls/quant/robustness_table.png

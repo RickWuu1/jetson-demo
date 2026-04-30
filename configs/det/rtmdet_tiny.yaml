@@ -1,0 +1,36 @@
+# RTMDet-Tiny detection config
+# Usage: loaded by scripts/det_baseline.py
+
+model:
+  arch: rtmdet
+  config_path: checkpoints/rtmdet_tiny_8xb32-300e_coco.py
+  checkpoint_path: checkpoints/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth
+  device: cuda
+  score_thr: 0.3
+  image_size: 640
+
+dataset:
+  data_type: demo        # demo = synthetic (no download); coco = real COCO
+  # data_type: coco
+  # data_root: data/coco
+  split: val
+  max_samples: 50        # 0 = use all
+  batch_size: 4
+  num_workers: 4
+  image_size: 640
+  num_classes: 80
+
+eval:
+  output_dir: outputs/det/baseline
+  score_thr: 0.3
+  iou_thr: 0.5
+
+attack:
+  attack_type: dpatch
+  patch_size: 50         # side length in pixels
+  image_size: 640
+  steps: 200
+  lr: 0.01
+  log_every: 50
+  device: cuda
+  output_dir: outputs/det/attacked

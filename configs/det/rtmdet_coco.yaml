@@ -1,0 +1,37 @@
+# RTMDet-Tiny config for real COCO val2017
+# Usage: python scripts/det_baseline.py --config configs/det/rtmdet_coco.yaml
+
+model:
+  arch: rtmdet
+  config_path: checkpoints/rtmdet_tiny_8xb32-300e_coco.py
+  checkpoint_path: checkpoints/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth
+  device: cuda
+  score_thr: 0.3
+  image_size: 640
+
+dataset:
+  data_type: coco
+  data_root: /home/kaixin/yisong          # not used directly; overridden below
+  coco_img_dir: /home/kaixin/yisong/val2017
+  coco_ann_file: /home/kaixin/yisong/annotations/instances_val2017.json
+  split: val2017
+  max_samples: 200                         # 0 = all 5000
+  batch_size: 4
+  num_workers: 4
+  image_size: 640
+  num_classes: 80
+
+eval:
+  output_dir: outputs/det/coco_baseline
+  score_thr: 0.3
+  iou_thr: 0.5
+
+attack:
+  attack_type: dpatch
+  patch_size: 80
+  image_size: 640
+  steps: 300
+  lr: 0.01
+  log_every: 50
+  device: cuda
+  output_dir: outputs/det/coco_attacked

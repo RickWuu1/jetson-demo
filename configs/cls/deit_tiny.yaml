@@ -1,0 +1,39 @@
+# DeiT-Tiny classification model config
+# Usage: loaded by scripts/cls_baseline.py and scripts/cls_attack.py
+
+model:
+  arch: deit
+  model_name: deit_tiny_patch16_224
+  pretrained: true
+  num_classes: 1000
+  device: cuda
+  # class_names_path: datasets/imagenet_classnames.json  # optional
+
+dataset:
+  # data_type: imagenet         # full ImageNet (requires ~150GB)
+  data_type: tiny_imagenet      # Tiny-ImageNet-200 (200 classes, data/tiny-imagenet-200/)
+  # data_type: demo             # synthetic data, no download needed
+  data_root: data/tiny-imagenet-200
+  split: val
+  max_samples: 1000             # 0 = use all 10000 val images
+  batch_size: 64
+  num_workers: 4
+  image_size: 224
+  num_classes: 200
+
+eval:
+  output_dir: outputs/cls/baseline
+
+attack:
+  attack_type: adv_patch
+  patch_size_ratio: 0.10        # patch = 10% of image width (~22x22 pixels)
+  image_size: 224
+  steps: 1000
+  lr: 0.005
+  targeted: false
+  target_class: 0               # only used if targeted=true
+  location_train: random
+  location_eval: center
+  log_every: 100
+  device: cuda
+  output_dir: outputs/cls/attacked

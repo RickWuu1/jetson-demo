@@ -1,0 +1,37 @@
+# Core deep learning
+# Install PyTorch separately with:
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url https://download.pytorch.org/whl/cu121
+
+timm==0.9.16
+
+# ONNX
+onnx==1.16.0
+onnxruntime-gpu==1.18.0
+
+# Config
+omegaconf==2.3.0
+
+# Detection evaluation (COCO)
+pycocotools==2.0.7
+
+# Image
+opencv-python==4.10.0.84
+Pillow==10.3.0
+
+# Numerics / visualization
+numpy==1.26.4
+matplotlib==3.9.0
+seaborn==0.13.2
+tqdm==4.66.4
+scipy==1.13.1
+
+# Logging / CLI
+colorlog==6.8.2
+pyyaml==6.0.1
+rich==13.7.1
+
+# mmdetection (install separately, see README)
+# pip install -U openmim
+# mim install mmengine
+# mim install "mmcv>=2.0.0"
+# mim install mmdet

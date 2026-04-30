@@ -1,0 +1,47 @@
+extra_prepare_dict:
+    extra_qconfig_dict:
+        w_observer: MSEObserver
+        a_observer: EMAMSEObserver
+        w_fakequantize: AdaRoundFakeQuantize
+        a_fakequantize: FixedFakeQuantize
+        w_qscheme:
+            bit: 8
+            symmetry: False
+            per_channel: True
+            pot_scale: False
+        a_qscheme:
+            bit: 8
+            symmetry: False
+            per_channel: False
+            pot_scale: False
+quantize:
+    quantize_type: advanced_ptq
+    cali_batchsize: 32          # 16 → 32: 更多干净校准数据，保住clean acc
+    reconstruction:
+        alpha: 1
+        beta: 1
+        rate: 0.2
+        backdoor: True
+        bd_target: 0
+        backward_num: 1
+        pattern: layer
+        warm_up: 0
+        weight: 0.08            # 0.01 → 0.08: 大幅增强后门损失权重
+        max_count: 15000        # 10000 → 15000: 更多迭代
+        b_range: [20,2]
+        keep_gpu: True
+        round_mode: learned_hard_sigmoid
+        prob: 1.0
+        minimal_loss: 0.1
+dataset:
+    batch_size: 32
+    num_workers: 16
+    pattern: stage2
+    trigger_policy: relative
+    trigger_base_size: 12
+    trigger_base_image_size: 224
+    # 5-region position-invariant trigger: 4 corners + center, each with ±jitter_px
+    pos_mode: 5region
+    jitter_px: 8                # 16 → 8: 缩小位置抖动，信号更集中
+process:
+    seed: 1005
