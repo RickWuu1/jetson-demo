@@ -1,200 +1,283 @@
-# Quantization-Activated Backdoor: Detection and Mitigation
+# Quantization-Activated Backdoor Demo
 
-> **研究问题：量化部署能否激活神经网络中的隐藏后门？如果能，推理时能否检测并缓解？**
->
-> 本项目以 ViT + CIFAR-10 为主线，完整实现 **量化激活后门攻击 → 注意力异常检测 → Attention-Guided PatchDrop 推理时缓解** 的闭环流程。
+本项目用于展示量化部署触发后门以及推理时防御的完整流程。当前代码包含两条演示路径：
 
----
+- 离线结果展示：FP32 ViT 在 Jetson 上现场推理，INT8-QURA 与防御结果使用 x86 预计算结果回放。
+- 实时摄像头展示：通过浏览器查看摄像头或视频流，并在可用时接入真实 QURA/ViT 推理、防御和注意力指标。
 
-## 主线核心结果（ViT + QuRA + W4A8）
+## 当前能力
+
+### 研究主线
+
+项目以 ViT + QuRA 为核心，验证量化后的后门激活现象，并使用注意力定位与 PatchDrop/RegionBlur 做推理时缓解。
 
 | 阶段 | Clean Acc | Trigger ASR | 状态 |
 |------|-----------|-------------|------|
-| FP32（未量化） | 97.26% | 1.20% | 后门休眠 |
-| W4A8 量化后 | 96.80% | **99.92%** | 后门激活 |
-| W4A8 + Attn-Guided PatchDrop | **96.48%** | **0.43%** | 后门缓解 |
-| W4A8 + Oracle 上界* | 96.76% | 0.48% | 理论上界 |
+| FP32 | 97.26% | 1.20% | 后门休眠 |
+| W4A8 量化后 | 96.80% | 99.92% | 后门激活 |
+| W4A8 + Attention-Guided PatchDrop | 96.48% | 0.43% | 后门缓解 |
+| W4A8 + Oracle | 96.76% | 0.48% | 理论上界 |
 
-*Oracle = 已知 trigger 精确位置时直接 mask，仅作为理论上界参考，非实际可部署方法
+防御流程：
 
-**完整故事**：
-
-```
-FP32 正常部署 → ASR 1.20%（后门休眠，无威胁）
-        ↓ QuRA W4A8 量化（AdaRound PTQ 后门注入）
-W4A8 量化后 → ASR 99.92%（后门激活，高危）
-        ↓ 注意力异常检测（trigger patch 占 76% CLS attention，616x 异常）
-        ↓ Attention-Guided PatchDrop（mask top-1 attention patch）
-W4A8 + 防御 → ASR 0.43%（后门缓解，clean acc 仅降 0.32%）
-```
-
-**项目定位**：test-time detect + mitigate（推理时检测与缓解），不涉及模型参数修改。
-
----
-
-## 防御流程
-
-```
-Input Image (224x224)
-       |
-  [Forward Pass] ──→ W4A8 ViT Model
-       |
-  [Extract Attention] ──→ Last-layer CLS attention (14x14 patches)
-       |
-  [Locate Top-1 Patch] ──→ Highest attention patch
-       |
-  [Zero-Mask 16x16 Region]
-       |
-  [Re-Infer] ──→ Clean prediction restored
+```text
+Input Image
+  -> ViT / QURA inference
+  -> CLS-to-patch attention extraction
+  -> suspicious region localization
+  -> PatchDrop / RegionBlur
+  -> second inference
+  -> restored prediction
 ```
 
----
+### Jetson 摄像头前端
 
-## 项目结构
+`scripts/camera_web_preview.py` 提供一个轻量 Web 前端：
 
-```
-demo/
-├── README.md                              # 本文件
-├── third_party/
-│   ├── qura/ours/main/                    # QuRA 官方代码（主线）
-│   │   ├── main.py                        #   攻击主脚本
-│   │   ├── configs/cv_vit_4_8_bd.yaml     #   W4A8 后门 PTQ 配置
-│   │   ├── setting/                       #   训练/数据/触发器工具
-│   │   └── model/                         #   模型权重
-│   │       ├── vit+cifar10.pth            #     FP32 clean (97.26%)
-│   │       └── vit+cifar10.quant_bd_None_t0.pth  # W4A8 backdoored
-│   ├── quanti_repro/Qu-ANTI-zation/       # Qu-ANTI-zation (ResNet-18, 辅助)
-│   └── backdoor_transformer_ref/          # 参考代码 (AAAI 2023)
-│
-├── outputs/
-│   ├── qura_vit/
-│   │   └── cifar10_bd_run_001/
-│   │       ├── attention_analysis/        # Stage 1: 注意力异常检测
-│   │       │   ├── analyze_attention.py
-│   │       │   ├── attention_metrics.json
-│   │       │   ├── attention_summary.png
-│   │       │   └── *.png (heatmaps)
-│   │       └── patchdrop_stage2/          # Stage 2: PatchDrop 防御评估
-│   │           ├── eval_patchdrop.py
-│   │           ├── eval_*.json (4 strategies)
-│   │           ├── defense_demo_panel.png
-│   │           └── patchdrop_comparison.png
-│   │
-│   ├── final_summary/                     # 主结果汇总
-│   │   ├── main_results.json
-│   │   └── main_results.md
-│   │
-│   └── presentation_assets/               # 汇报用素材
-│       ├── generate_assets.py
-│       ├── meeting_summary.md             # 组会摘要（中文）
-│       ├── main_results_table.csv / .png
-│       ├── story_pipeline.png
-│       ├── attention_detection.png
-│       └── patchdrop_effect.png
-│
+- 使用 Python 标准库提供页面、REST API 和 MJPEG 视频流。
+- 使用 OpenCV 读取 `usb`、`csi`、摄像头编号、图片或视频文件。
+- 页面包含模式切换、攻击开关、防御开关、防御模式切换、快照和状态卡片。
+- 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
+- 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
+
+前端接口：
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/` | GET | Web 控制台 |
+| `/stream.mjpg` | GET | MJPEG 视频流 |
+| `/api/status` | GET | 当前视频、模型、推理和运行时状态 |
+| `/api/control` | POST | 设置 `mode`、`attack_on`、`defense_on`、`defense_mode` |
+| `/api/snapshot` | GET | 当前帧快照 |
+
+## 目录结构
+
+```text
+.
+├── README.md
 ├── demos/
-│   └── final_vit_patchdrop_demo.py        # 一键 demo（生成完整流程图）
-│
-├── models/                                # 辅助：DeiT/RTMDet PTQ benchmark
-├── scripts/                               # 辅助：PTQ + 对抗攻击脚本
-├── attacks/                               # 辅助：对抗攻击实现
-└── eval/                                  # 辅助：评测工具
+│   ├── demo_qura_realtime_full.py      # 实时 QURA/ViT 推理与防御入口
+│   ├── final_vit_patchdrop_demo.py     # 离线面板 demo
+│   └── ...
+├── scripts/
+│   ├── camera_web_preview.py           # 浏览器摄像头前端
+│   ├── jetson_demo_imagenet.py         # Jetson 离线 ImageNet demo
+│   └── ...
+├── third_party/
+│   └── qura/                           # QuRA / MQBench 相关代码
+├── utils/
+│   └── qura_checkpoint.py
+├── configs/
+├── attacks/
+├── eval/
+└── outputs/                            # 大文件产物，通常不提交
 ```
 
----
+## Windows 验证
 
-## 主线实验（QuRA + ViT + W4A8）
+Windows 侧主要用于验证页面、视频流和接口，不要求具备完整 QURA 环境。
 
-### Step 1: ViT Clean 预训练
-
-使用 QuRA 官方 `setting/train_model.py`，ViT-Tiny (timm) + CIFAR-10 (224x224)，AdamW lr=1e-4, 20 epochs。
+安装基础依赖：
 
 ```bash
-cd third_party/qura/ours/main
-conda run -n qura python setting/train_model.py
-# → Clean Acc: 97.26% ✓
+pip install opencv-python numpy
 ```
 
-### Step 2: QuRA W4A8 后门 PTQ 攻击
-
-使用 `cv_vit_4_8_bd.yaml` 配置，MQBench AdaRound，seed=1005，target=0，12x12 trigger。
+使用测试图像流：
 
 ```bash
-conda run -n qura python main.py --config configs/cv_vit_4_8_bd.yaml
-# → FP32 ASR: 1.20% (dormant), W4A8 ASR: 99.92% (activated) ✓
+python scripts/camera_web_preview.py --source placeholder
 ```
 
-### Stage 1: 注意力异常检测
-
-提取 FP32/W4A8 × Clean/Trigger 四种条件下的 CLS-to-patch attention。
-
-| 条件 | Trigger Patch 注意力占比 | Trigger/Avg Ratio |
-|------|------------------------|-------------------|
-| W4A8 + 正常输入 | 2.92% | 5.86x |
-| W4A8 + 触发输入 | **75.98%** | **616.78x** |
+使用本地视频文件：
 
 ```bash
-conda run -n qura python outputs/qura_vit/cifar10_bd_run_001/attention_analysis/analyze_attention.py
+python scripts/camera_web_preview.py --source "C:\Users\dawn\Desktop\sample-5s.mp4"
 ```
 
-### Stage 2: Attention-Guided PatchDrop 防御
-
-4 种策略全测试集评估（10000 clean + 9000 trigger）：
-
-| 策略 | Clean Acc | Trigger ASR | 说明 |
-|------|-----------|-------------|------|
-| 无防御 | 96.80% | 99.92% | 基线 |
-| 随机 PatchDrop | 96.79% | 99.36% | 随机 mask 无效 |
-| **注意力引导 PatchDrop** | **96.48%** | **0.43%** | mask top-1 attention patch |
-| Oracle 上界* | 96.76% | 0.48% | 已知 trigger 位置（理论上界） |
+使用 USB 摄像头：
 
 ```bash
-conda run -n qura python outputs/qura_vit/cifar10_bd_run_001/patchdrop_stage2/eval_patchdrop.py
+python scripts/camera_web_preview.py --source usb
 ```
 
-### Demo
+浏览器打开：
 
-生成完整流程演示面板：
+```text
+http://127.0.0.1:8000
+```
+
+如果 Windows 没有 QURA 权重或依赖，页面会显示 `QURA unavailable`，视频预览仍会继续运行。
+
+## Jetson 运行
+
+当前目标 Jetson 环境：
+
+| 项 | 配置 |
+|----|------|
+| JetPack | R36.4.3 |
+| OS | Ubuntu 22.04 |
+| Kernel | 5.15 aarch64 |
+| Python | 3.10.12 |
+| PyTorch | 2.7.0 |
+| CUDA | 12.6 |
+
+### 摄像头前端
+
+CSI 摄像头：
 
 ```bash
-conda run -n qura python demos/final_vit_patchdrop_demo.py
-# → outputs/final_demo_panel.png
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --int8-only
 ```
 
----
-
-## 辅助实验（ResNet-18 + Qu-ANTI-zation + CLP）
-
-另一条独立的攻击-防御实验线，基于 ResNet-18 / CIFAR-10 / INT4 量化：
-
-| 阶段 | Clean Acc | Trigger ASR |
-|------|-----------|-------------|
-| INT4 量化后 | 89.60% | 98.64% |
-| INT4 + CLP 防御 | 86.31% | 11.55% |
-
-详见 `third_party/quanti_repro/` 和 `outputs/quanti_repro/`、`outputs/clp/`。
-
----
-
-## 环境
+USB 摄像头：
 
 ```bash
-# 主线（QuRA + ViT）
-conda activate qura
-# Python 3.8, torch 1.10.0+cu113, timm 1.0.25, MQBench
-
-# 辅助（Qu-ANTI-zation + CLP）
-conda activate demo_adv
-# Python 3.11, torch 2.2.2, CUDA 12.x
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source usb \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --int8-only
 ```
 
-**GPU**: NVIDIA L40
+访问：
 
----
+```text
+http://<jetson-ip>:8000
+```
 
-## 参考文献
+### JIT Bundle 路线
 
-- **QuRA**: Hu et al., "Quantization Backdoor Attack" (量化 rounding 引导后门注入)
-- **Qu-ANTI-zation**: Hong et al., NeurIPS 2021. [[arXiv]](https://arxiv.org/abs/2110.03144)
-- **CLP**: Tang et al., ECCV 2022. (Channel Lipschitzness-based Pruning)
-- **Patch Processing Defense**: Defending Backdoor Attacks on Vision Transformer via Patch Processing, AAAI 2023.
+如果只需要稳定展示 FP32 JIT 与摄像头前端，可以使用 JIT bundle，避开 MQBench：
+
+```bash
+cd ~/demo
+python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --jetson-bundle outputs/jetson_imagenet_demo
+```
+
+### 离线 ImageNet Demo
+
+```bash
+cd ~/demo
+python3 scripts/jetson_demo_imagenet.py \
+  --data_dir outputs/jetson_imagenet_demo \
+  --max_images 10
+```
+
+### 实时 QURA 命令行 Demo
+
+不通过浏览器，直接运行 OpenCV 实时入口：
+
+```bash
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 demos/demo_qura_realtime_full.py \
+  --no-detector \
+  --source csi \
+  --attack-on-start \
+  --defense-on-start \
+  --defense-mode-start patchdrop \
+  --no-display \
+  --max-frames 20
+```
+
+## PyTorch 2.7 与 MQBench
+
+Jetson 当前使用 PyTorch 2.7 + CUDA 12.6。原始 MQBench 主要面向 torch 1.x，直接运行可能会遇到 API 兼容问题。当前 Jetson 环境已打兼容补丁后，可以尝试 live INT8-QURA 路线：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --int8-only
+```
+
+如果 INT8-QURA 加载失败，Web 页面会保留视频流，并在 Runtime/QURA 状态卡中显示具体原因。
+
+## Web 控制台功能
+
+页面按钮与含义：
+
+| 按钮 | 作用 |
+|------|------|
+| Normal / FP32 | 使用 FP32/JIT 优先的正常模式 |
+| Triggered / INT8 | 开启 trigger，优先使用 INT8-QURA |
+| Defended | 开启 trigger 与 defense |
+| Attack | 单独开关 trigger |
+| Defense | 单独开关防御 |
+| Defense Mode | 在 `oracle`、`regionblur`、`patchdrop` 间切换 |
+| Refresh Stream | 重新连接 MJPEG 流 |
+| Snapshot | 打开当前帧 JPEG |
+
+状态卡显示：
+
+- 视频源、帧数、FPS
+- QURA 是否可用
+- 当前模型、torch/cuda/device
+- prediction、confidence
+- attention ratio
+- backdoor / suspicious / defense 状态
+- 最近错误信息
+
+## 常见问题
+
+### 浏览器仍显示旧页面
+
+强制刷新：
+
+```text
+Ctrl+F5
+```
+
+或直接打开视频流：
+
+```text
+http://127.0.0.1:8000/stream.mjpg?fps=15
+```
+
+### 端口被旧服务占用
+
+停止旧进程后重新启动服务。
+
+Windows PowerShell 可检查：
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*camera_web_preview.py*' }
+```
+
+### Jetson 摄像头不可见
+
+检查设备：
+
+```bash
+ls /dev/video*
+```
+
+CSI 摄像头使用 `--source csi`，USB 摄像头使用 `--source usb`。
+
+### QURA unavailable
+
+这表示视频服务正常，但模型管线没有加载成功。常见原因：
+
+- 缺少 `third_party/qura` 的 `PYTHONPATH`
+- 权重文件未同步到 Jetson
+- MQBench patch 未生效
+- `timm`、`omegaconf` 或相关依赖缺失
+- 使用 JIT bundle 时 `outputs/jetson_imagenet_demo` 不完整
+
+## 参考
+
+- QuRA: Quantization Backdoor Attack
+- Qu-ANTI-zation: NeurIPS 2021
+- CLP: Channel Lipschitzness-based Pruning
+- Patch Processing Defense: AAAI 2023
