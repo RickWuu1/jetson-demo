@@ -279,6 +279,15 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
 - backdoor / suspicious / defense 状态
 - 最近错误信息
 
+如果页面只显示 `class_923` 这类编号，说明当前环境没有可读取的 ImageNet 标签。程序会按顺序尝试：
+
+- `assets/imagenet_labels.txt`
+- `assets/synset_words.txt`
+- `torchvision.models.IMAGENET1K_V1`
+- `torchvision.models._meta._IMAGENET_CATEGORIES`
+
+仍然只显示编号时，可以手动放置每行一个类别名的 `assets/imagenet_labels.txt`。
+
 ## 常见问题
 
 ### 浏览器仍显示旧页面

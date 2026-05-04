@@ -103,6 +103,12 @@ def _load_imagenet_labels() -> List[str]:
         return list(IMAGENET1K_V1.meta["categories"])
     except Exception:
         pass
+    try:
+        from torchvision.models._meta import _IMAGENET_CATEGORIES
+
+        return list(_IMAGENET_CATEGORIES)
+    except Exception:
+        pass
     return [f"class_{i}" for i in range(1000)]
 
 
