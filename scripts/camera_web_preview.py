@@ -242,6 +242,8 @@ class RealtimeQuraPipeline:
         attack_on: bool,
         defense_on: bool,
         defense_mode: str,
+        force_inference: bool = True,
+        cached_metrics: Optional[Dict[str, object]] = None,
     ) -> Tuple[np.ndarray, Dict[str, object]]:
         if not self.available or self.module is None:
             return frame, self.status_metrics()
@@ -264,6 +266,20 @@ class RealtimeQuraPipeline:
             )
             attacked_frame = realtime.paste_patch_bgr(attacked_frame, self.patch, attack_bbox)
 
+        if not force_inference and cached_metrics and cached_metrics.get("qura_available"):
+            vis = attacked_frame.copy()
+            if attack_bbox is not None:
+                vis = realtime.draw_overlay_box(vis, attack_bbox, (0, 0, 255), "trigger")
+            defense_bbox = cached_metrics.get("defense_bbox")
+            if defense_bbox:
+                vis = realtime.draw_overlay_box(vis, tuple(defense_bbox), (0, 220, 220), "defense")
+            patchdrop_boxes = cached_metrics.get("patchdrop_boxes")
+            if patchdrop_boxes:
+                vis = realtime.draw_patchdrop_boxes(vis, [tuple(box) for box in patchdrop_boxes], h, w)
+            metrics = dict(cached_metrics)
+            metrics["inference_cached"] = True
+            return vis, metrics
+
         model_name, backbone = self._select_backbone(mode)
         if backbone is None:
             metrics = self.status_metrics()
@@ -275,9 +291,8 @@ class RealtimeQuraPipeline:
         patchdrop_boxes = None
         cls_override = None
 
-        class_idx, conf, label = backbone.classify(attacked_frame)
+        class_idx, conf, label, topk, attn = backbone.predict_with_attention(attacked_frame, topk=self.args.prediction_topk)
         backdoor_active = backbone.is_backdoor_active(class_idx)
-        attn = backbone.get_attn(attacked_frame)
         detection_metrics = realtime.attention_detection_metrics(attn, self.args.detect_threshold)
         suspicious = bool(detection_metrics["is_suspicious"] > 0)
         defense_applied = False
@@ -310,9 +325,9 @@ class RealtimeQuraPipeline:
                 defense_applied = True
 
         if cls_override is not None:
-            class_idx, conf, label = cls_override
+            class_idx, conf, label, topk = cls_override
         elif defense_applied:
-            class_idx, conf, label = backbone.classify(display_frame)
+            class_idx, conf, label, topk, _ = backbone.predict_with_attention(display_frame, topk=self.args.prediction_topk)
         backdoor_active = backbone.is_backdoor_active(class_idx)
 
         vis = display_frame.copy()
@@ -329,12 +344,18 @@ class RealtimeQuraPipeline:
             "qura_available": True,
             "qura_error": None,
             "model": model_name,
-            "prediction": label,
+            "prediction": realtime.prediction_text(class_idx, label),
+            "prediction_label": label,
             "class_idx": class_idx,
             "confidence": float(conf),
+            "topk": topk,
             "backdoor_active": bool(backdoor_active),
             "suspicious": bool(suspicious),
             "defense_applied": bool(defense_applied),
+            "inference_cached": False,
+            "attack_bbox": list(attack_bbox) if attack_bbox is not None else None,
+            "defense_bbox": list(defense_bbox) if defense_bbox is not None else None,
+            "patchdrop_boxes": [list(box) for box in patchdrop_boxes] if patchdrop_boxes else None,
             "attention_ratio": float(detection_metrics["ratio"]),
             "attention_peak_idx": int(detection_metrics["peak_idx"]),
             "attention_max": float(detection_metrics["max"]),
@@ -351,11 +372,17 @@ class RealtimeQuraPipeline:
             "qura_error": self.unavailable_reason,
             "model": "unavailable",
             "prediction": "QURA unavailable",
+            "prediction_label": None,
             "class_idx": None,
             "confidence": None,
+            "topk": [],
             "backdoor_active": False,
             "suspicious": False,
             "defense_applied": False,
+            "inference_cached": False,
+            "attack_bbox": None,
+            "defense_bbox": None,
+            "patchdrop_boxes": None,
             "attention_ratio": None,
             "attention_peak_idx": None,
             "attention_max": None,
@@ -393,6 +420,8 @@ class FrameHub:
         csi_flip_method: int,
         fallback_placeholder: bool,
         qura_pipeline: Optional[RealtimeQuraPipeline],
+        infer_every_n: int,
+        defense_infer_every_n: int,
     ) -> None:
         self.source = source
         self.width = width
@@ -403,6 +432,8 @@ class FrameHub:
         self.csi_flip_method = csi_flip_method
         self.fallback_placeholder = fallback_placeholder
         self.qura_pipeline = qura_pipeline
+        self.infer_every_n = max(1, infer_every_n)
+        self.defense_infer_every_n = max(self.infer_every_n, defense_infer_every_n)
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -420,6 +451,8 @@ class FrameHub:
         self._attack_on = False
         self._defense_on = False
         self._defense_mode = "patchdrop"
+        self._last_inference_frame = -10**9
+        self._last_inference_key = None
         self._metrics: Dict[str, object] = (
             qura_pipeline.status_metrics() if qura_pipeline is not None else self._camera_only_metrics("QURA disabled")
         )
@@ -460,6 +493,8 @@ class FrameHub:
                 "attack_on": self._attack_on,
                 "defense_on": self._defense_on,
                 "defense_mode": self._defense_mode,
+                "infer_every_n": self.infer_every_n,
+                "defense_infer_every_n": self.defense_infer_every_n,
             }
             status.update(self._metrics)
             return status
@@ -489,6 +524,7 @@ class FrameHub:
                 if defense_mode not in DEFENSE_MODES:
                     raise ValueError(f"Invalid defense_mode: {defense_mode}")
                 self._defense_mode = defense_mode
+            self._last_inference_key = None
         return self.status()
 
     def _set_error(self, message: Optional[str]) -> None:
@@ -538,7 +574,26 @@ class FrameHub:
         if self.qura_pipeline is None:
             return frame, self._camera_only_metrics("QURA disabled")
         try:
-            return self.qura_pipeline.process(frame, mode, attack_on, defense_on, defense_mode)
+            key = (mode, attack_on, defense_on, defense_mode)
+            interval = self.defense_infer_every_n if mode == "defended" and defense_on else self.infer_every_n
+            current_frame = self._frame_index
+            force_inference = (
+                self._last_inference_key != key
+                or current_frame - self._last_inference_frame >= interval
+            )
+            processed, metrics = self.qura_pipeline.process(
+                frame,
+                mode,
+                attack_on,
+                defense_on,
+                defense_mode,
+                force_inference=force_inference,
+                cached_metrics=self._metrics,
+            )
+            if not metrics.get("inference_cached"):
+                self._last_inference_frame = current_frame
+                self._last_inference_key = key
+            return processed, metrics
         except Exception as exc:
             LOGGER.warning("QURA frame processing failed: %s", exc)
             LOGGER.debug("QURA frame traceback:\n%s", traceback.format_exc())
@@ -550,11 +605,17 @@ class FrameHub:
             "qura_error": reason,
             "model": "camera-only",
             "prediction": "camera preview only",
+            "prediction_label": None,
             "class_idx": None,
             "confidence": None,
+            "topk": [],
             "backdoor_active": False,
             "suspicious": False,
             "defense_applied": False,
+            "inference_cached": False,
+            "attack_bbox": None,
+            "defense_bbox": None,
+            "patchdrop_boxes": None,
             "attention_ratio": None,
             "attention_peak_idx": None,
             "attention_max": None,
@@ -726,6 +787,7 @@ def index_html() -> bytes:
       <div class="card"><div class="label">Model</div><div class="value" id="model">-</div></div>
       <div class="card"><div class="label">Runtime</div><div class="value" id="runtime">-</div></div>
       <div class="card"><div class="label">Prediction</div><div class="value" id="prediction">-</div></div>
+      <div class="card"><div class="label">Top Predictions</div><div class="value" id="topk">-</div></div>
       <div class="card"><div class="label">Attention Ratio</div><div class="value" id="attention">-</div></div>
       <div class="card"><div class="label">Backdoor</div><div class="value" id="backdoor">-</div></div>
       <div class="card"><div class="label">Defense</div><div class="value" id="defense">-</div></div>
@@ -753,7 +815,8 @@ def index_html() -> bytes:
       document.getElementById('modePill').textContent = `mode: ${data.mode}`;
       document.getElementById('source').textContent = `${data.source} -> ${data.actual_source}`;
       document.getElementById('frames').textContent = data.frame_index;
-      document.getElementById('fps').textContent = `${data.measured_fps} / target ${data.target_fps}`;
+      const cacheText = data.inference_cached ? 'cached infer' : 'fresh infer';
+      document.getElementById('fps').textContent = `${data.measured_fps} / target ${data.target_fps} / ${cacheText}`;
       const qura = document.getElementById('qura');
       qura.textContent = data.qura_available ? 'available' : `unavailable: ${data.qura_error || 'unknown'}`;
       qura.className = data.qura_available ? 'value ok' : 'value error';
@@ -761,6 +824,10 @@ def index_html() -> bytes:
       document.getElementById('runtime').textContent = `torch ${data.torch_version || '-'} / cuda ${data.cuda_version || '-'} / ${data.vit_device || '-'}`;
       const confidence = data.confidence === null || data.confidence === undefined ? '-' : `${Math.round(data.confidence * 100)}%`;
       document.getElementById('prediction').textContent = `${data.prediction || '-'} (${confidence})`;
+      const topk = Array.isArray(data.topk) ? data.topk : [];
+      document.getElementById('topk').innerHTML = topk.length
+        ? topk.map(item => `${item.display || item.label || '-'} (${Math.round((item.confidence || 0) * 100)}%)`).join('<br>')
+        : '-';
       const ratio = data.attention_ratio === null || data.attention_ratio === undefined ? '-' : `${Number(data.attention_ratio).toFixed(1)}x`;
       document.getElementById('attention').textContent = ratio;
 
@@ -962,6 +1029,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-topk", type=int, default=5)
     parser.add_argument("--attn-reduce", default="std", choices=["std", "mean"])
     parser.add_argument("--detect-threshold", type=float, default=50.0)
+    parser.add_argument("--prediction-topk", type=int, default=5, help="Number of ImageNet classes to show in the UI.")
+    parser.add_argument("--infer-every-n", type=int, default=5, help="Run ViT/QURA every N video frames and cache metrics between runs.")
+    parser.add_argument("--defense-infer-every-n", type=int, default=15, help="Run defended mode inference every N video frames.")
     parser.add_argument("--heatmap-overlay", action="store_true")
     parser.add_argument("--vit-device", default="cuda")
     parser.add_argument("--blur-kernel", type=int, default=31)
@@ -990,6 +1060,8 @@ def main() -> None:
         csi_flip_method=args.csi_flip_method,
         fallback_placeholder=not args.no_placeholder_fallback,
         qura_pipeline=qura_pipeline,
+        infer_every_n=args.infer_every_n,
+        defense_infer_every_n=args.defense_infer_every_n,
     )
     hub.start()
 

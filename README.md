@@ -37,6 +37,8 @@ Input Image
 - 使用 Python 标准库提供页面、REST API 和 MJPEG 视频流。
 - 使用 OpenCV 读取 `usb`、`csi`、摄像头编号、图片或视频文件。
 - 页面包含模式切换、攻击开关、防御开关、防御模式切换、快照和状态卡片。
+- 视频流和 ViT/QURA 推理解耦：视频按摄像头帧率更新，推理结果按固定间隔刷新并缓存。
+- 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
 - 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
 
@@ -132,6 +134,10 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --source csi \
   --host 0.0.0.0 \
   --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
   --int8-only
 ```
 
@@ -143,6 +149,10 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --source usb \
   --host 0.0.0.0 \
   --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
   --int8-only
 ```
 
@@ -150,6 +160,42 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
 
 ```text
 http://<jetson-ip>:8000
+```
+
+默认情况下，Web 前端不会对每个视频帧都运行 ViT/QURA 推理：
+
+- `--infer-every-n 5`：普通和触发模式每 5 帧刷新一次推理结果。
+- `--defense-infer-every-n 15`：防御模式每 15 帧刷新一次推理结果。
+- 两次推理之间复用最近一次 prediction、attention ratio 和 defense 状态。
+
+如果需要进一步提高画面流畅度，可以把间隔调大：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
+  --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30
+```
+
+只测试摄像头清晰度和裸视频流时，可以关闭 QURA：
+
+```bash
+python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
+  --disable-qura
 ```
 
 ### JIT Bundle 路线
@@ -199,6 +245,10 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --source csi \
   --host 0.0.0.0 \
   --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
   --int8-only
 ```
 
@@ -224,7 +274,7 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
 - 视频源、帧数、FPS
 - QURA 是否可用
 - 当前模型、torch/cuda/device
-- prediction、confidence
+- prediction、confidence、top-k 候选类别
 - attention ratio
 - backdoor / suspicious / defense 状态
 - 最近错误信息

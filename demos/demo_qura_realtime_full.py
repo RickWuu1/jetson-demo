@@ -97,7 +97,40 @@ def _load_imagenet_labels() -> List[str]:
         if p.exists():
             lines = p.read_text().splitlines()
             return [l.split(" ", 1)[1] if " " in l else l for l in lines if l.strip()]
+    try:
+        from torchvision.models import IMAGENET1K_V1
+
+        return list(IMAGENET1K_V1.meta["categories"])
+    except Exception:
+        pass
     return [f"class_{i}" for i in range(1000)]
+
+
+def imagenet_label(idx: int) -> str:
+    return IMAGENET_LABELS[idx] if idx < len(IMAGENET_LABELS) else f"class_{idx}"
+
+
+def prediction_text(idx: int, label: str) -> str:
+    if label == f"class_{idx}":
+        return label
+    return f"class_{idx}: {label}"
+
+
+def logits_topk(logits: torch.Tensor, k: int = 5) -> List[Dict[str, object]]:
+    probs = torch.softmax(logits, dim=-1)
+    limit = max(1, min(k, probs.shape[-1]))
+    confs, indices = torch.topk(probs[0], k=limit)
+    rows: List[Dict[str, object]] = []
+    for conf, idx_t in zip(confs, indices):
+        idx = int(idx_t.item())
+        label = imagenet_label(idx)
+        rows.append({
+            "class_idx": idx,
+            "label": label,
+            "display": prediction_text(idx, label),
+            "confidence": float(conf.item()),
+        })
+    return rows
 
 
 IMAGENET_LABELS = _load_imagenet_labels()
@@ -330,21 +363,7 @@ class ViTBackbone:
         self._last_attn = attn.detach()
 
 
-    @torch.no_grad()
-    def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
-        x = frame_to_vit_tensor(frame_bgr, self.device)
-        logits = self.model(x)
-        probs = torch.softmax(logits, dim=-1)
-        conf, idx = probs[0].max(dim=0)
-        idx = int(idx.item())
-        label = IMAGENET_LABELS[idx] if idx < len(IMAGENET_LABELS) else f"class_{idx}"
-        return idx, float(conf.item()), label
-
-    @torch.no_grad()
-    def get_attn(self, frame_bgr: np.ndarray) -> np.ndarray:
-        x = frame_to_vit_tensor(frame_bgr, self.device)
-        self._last_attn = None
-        self.model(x)
+    def _current_attention(self) -> np.ndarray:
         if self._last_attn is None:
             return np.ones(14 * 14, dtype=np.float32) / (14 * 14)
         cls_patch = self._last_attn[0, :, 0, 1:]
@@ -353,6 +372,31 @@ class ViTBackbone:
         else:
             reduced = cls_patch.mean(dim=0)
         return reduced.cpu().numpy()
+
+    @torch.no_grad()
+    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
+        x = frame_to_vit_tensor(frame_bgr, self.device)
+        self._last_attn = None
+        logits = self.model(x)
+        top = logits_topk(logits, topk)
+        best = top[0]
+        return (
+            int(best["class_idx"]),
+            float(best["confidence"]),
+            str(best["label"]),
+            top,
+            self._current_attention(),
+        )
+
+    @torch.no_grad()
+    def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
+        class_idx, conf, label, _, _ = self.predict_with_attention(frame_bgr, topk=1)
+        return class_idx, conf, label
+
+    @torch.no_grad()
+    def get_attn(self, frame_bgr: np.ndarray) -> np.ndarray:
+        _, _, _, _, attn = self.predict_with_attention(frame_bgr, topk=1)
+        return attn
 
     def is_backdoor_active(self, class_idx: int) -> bool:
         return class_idx == self.bd_target
@@ -382,23 +426,27 @@ class JetsonJitBundleBackbone:
             self.trigger_norm = self.trigger_norm[0]
 
     @torch.no_grad()
-    def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
+    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
         x = frame_to_vit_tensor(frame_bgr, self.device)
         out = self.model(x)
         logits = out[0] if isinstance(out, (tuple, list)) else out
-        probs = torch.softmax(logits, dim=-1)
-        conf, idx = probs[0].max(dim=0)
-        idx = int(idx.item())
-        label = IMAGENET_LABELS[idx] if idx < len(IMAGENET_LABELS) else f"class_{idx}"
-        return idx, float(conf.item()), label
+        top = logits_topk(logits, topk)
+        best = top[0]
+        if isinstance(out, (tuple, list)) and len(out) >= 2:
+            attn = out[1][0].detach().cpu().numpy().reshape(-1)
+        else:
+            attn = np.ones(14 * 14, dtype=np.float32) / (14 * 14)
+        return int(best["class_idx"]), float(best["confidence"]), str(best["label"]), top, attn
+
+    @torch.no_grad()
+    def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
+        class_idx, conf, label, _, _ = self.predict_with_attention(frame_bgr, topk=1)
+        return class_idx, conf, label
 
     @torch.no_grad()
     def get_attn(self, frame_bgr: np.ndarray) -> np.ndarray:
-        x = frame_to_vit_tensor(frame_bgr, self.device)
-        out = self.model(x)
-        if not isinstance(out, (tuple, list)) or len(out) < 2:
-            return np.ones(14 * 14, dtype=np.float32) / (14 * 14)
-        return out[1][0].detach().cpu().numpy().reshape(-1)
+        _, _, _, _, attn = self.predict_with_attention(frame_bgr, topk=1)
+        return attn
 
     def is_backdoor_active(self, class_idx: int) -> bool:
         return class_idx == self.bd_target
@@ -517,13 +565,13 @@ def gated_patchdrop_tensor(
     device: torch.device,
     bd_target: int,
     patch_topk: int,
-) -> Tuple[np.ndarray, Optional[List[Tuple[int, int, int, int]]], Optional[Tuple[int, float, str]]]:
+) -> Tuple[np.ndarray, Optional[List[Tuple[int, int, int, int]]], Optional[Tuple[int, float, str, List[Dict[str, object]]]]]:
     """
     std attention + top-k zero mask + gate (only mitigate if first pred == bd_target).
 
     Returns:
         display_bgr, patch_boxes_or_None, cls_override_or_None.
-        When gate fires, cls_override is (pred, conf, label) from the **second** forward on
+        When gate fires, cls_override is (pred, conf, label, topk) from the **second** forward on
         the masked tensor so the main loop can skip an extra ViT forward via classify().
     """
     x = frame_to_vit_tensor(frame_bgr, device)
@@ -553,12 +601,12 @@ def gated_patchdrop_tensor(
         boxes.append((y1, x1, y2, x2))
 
     logits1 = model(masked)
-    probs = torch.softmax(logits1, dim=-1)
-    conf_t, idx = probs[0].max(dim=0)
-    pred = int(idx.item())
-    label = IMAGENET_LABELS[pred] if pred < len(IMAGENET_LABELS) else f"class_{pred}"
+    top = logits_topk(logits1, k=5)
+    pred = int(top[0]["class_idx"])
+    label = str(top[0]["label"])
+    conf = float(top[0]["confidence"])
     out_bgr = vit_tensor_to_bgr(masked)
-    return out_bgr, boxes, (pred, float(conf_t.item()), label)
+    return out_bgr, boxes, (pred, conf, label, top)
 
 
 def draw_detections(frame: np.ndarray, preds: Dict[str, torch.Tensor], suppress: bool = False) -> np.ndarray:
@@ -902,12 +950,11 @@ def main():
             display_frame = attacked_frame
             defense_bbox = None
             patchdrop_boxes = None
-            cls_override: Optional[Tuple[int, float, str]] = None
+            cls_override: Optional[Tuple[int, float, str, List[Dict[str, object]]]] = None
             model_name, backbone = backbones[backbone_idx]
 
-            initial_class_idx, initial_conf, initial_label = backbone.classify(attacked_frame)
+            initial_class_idx, initial_conf, initial_label, _, attn = backbone.predict_with_attention(attacked_frame, topk=5)
             initial_backdoor_active = backbone.is_backdoor_active(initial_class_idx)
-            attn = backbone.get_attn(attacked_frame)
             detection_metrics = attention_detection_metrics(attn, args.detect_threshold)
             suspicious = bool(detection_metrics["is_suspicious"] > 0)
             should_defend = defense_on and (suspicious or initial_backdoor_active)
@@ -939,7 +986,7 @@ def main():
                         defense_applied = True
 
             if cls_override is not None:
-                class_idx, conf, label = cls_override
+                class_idx, conf, label, _ = cls_override
             elif defense_applied:
                 class_idx, conf, label = backbone.classify(display_frame)
             else:
