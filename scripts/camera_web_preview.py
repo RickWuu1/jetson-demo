@@ -153,6 +153,7 @@ class RealtimeQuraPipeline:
         self.fp32_backbone = None
         self.qura_backbone = None
         self.patch = None
+        self.trigger_norm = None
         self.model_names = []
         self.torch_version = None
         self.cuda_version = None
@@ -178,8 +179,11 @@ class RealtimeQuraPipeline:
 
             bundle_dir = Path(args.jetson_bundle) if args.jetson_bundle else None
             self.patch = realtime.load_patch_tensor(args.patch, patch_size=args.patch_size)
+            self.trigger_norm = realtime.load_trigger_norm_tensor(args.patch, patch_size=args.patch_size)
             if self.patch is None and bundle_dir is not None:
                 self.patch = realtime.load_bundle_trigger_patch(bundle_dir, patch_size=args.patch_size)
+            if self.trigger_norm is None and bundle_dir is not None:
+                self.trigger_norm = realtime.load_bundle_trigger_norm(bundle_dir, patch_size=args.patch_size)
 
             if bundle_dir is not None:
                 self.fp32_backbone = realtime.JetsonJitBundleBackbone(bundle_dir, self.device, bd_target=args.bd_target)
@@ -266,6 +270,13 @@ class RealtimeQuraPipeline:
             )
             attacked_frame = realtime.paste_patch_bgr(attacked_frame, self.patch, attack_bbox)
 
+        model_input = None
+        if attack_on and self.trigger_norm is not None:
+            model_input = realtime.apply_trigger_norm_tensor(
+                realtime.frame_to_vit_tensor(frame, self.device),
+                self.trigger_norm,
+            )
+
         if not force_inference and cached_metrics and cached_metrics.get("qura_available"):
             vis = attacked_frame.copy()
             if attack_bbox is not None:
@@ -291,7 +302,10 @@ class RealtimeQuraPipeline:
         patchdrop_boxes = None
         cls_override = None
 
-        class_idx, conf, label, topk, attn = backbone.predict_with_attention(attacked_frame, topk=self.args.prediction_topk)
+        if model_input is not None:
+            class_idx, conf, label, topk, attn = backbone.predict_tensor_with_attention(model_input, topk=self.args.prediction_topk)
+        else:
+            class_idx, conf, label, topk, attn = backbone.predict_with_attention(attacked_frame, topk=self.args.prediction_topk)
         backdoor_active = backbone.is_backdoor_active(class_idx)
         detection_metrics = realtime.attention_detection_metrics(attn, self.args.detect_threshold)
         suspicious = bool(detection_metrics["is_suspicious"] > 0)
@@ -315,6 +329,7 @@ class RealtimeQuraPipeline:
                     self.device,
                     self.args.bd_target,
                     self.args.patch_topk,
+                    input_tensor=model_input,
                 )
                 display_frame = cv2.resize(display_frame, (w, h), interpolation=cv2.INTER_LINEAR)
                 defense_applied = bool(patchdrop_boxes)

@@ -249,6 +249,43 @@ def load_bundle_trigger_patch(data_dir: Path, patch_size: int = 0) -> Optional[t
     return patch.cpu()
 
 
+def load_trigger_norm_tensor(path: Optional[str], patch_size: int = 0) -> Optional[torch.Tensor]:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    obj = torch.load(str(p), map_location="cpu")
+    if isinstance(obj, dict):
+        for key in ("trigger", "patch"):
+            if key in obj:
+                obj = obj[key]
+                break
+    trigger = torch.as_tensor(obj).float()
+    if trigger.dim() == 4 and trigger.shape[0] == 1:
+        trigger = trigger.squeeze(0)
+    if trigger.dim() != 3:
+        raise ValueError(f"Expected CHW trigger tensor, got {tuple(trigger.shape)}")
+    if trigger.shape[0] not in (1, 3) and trigger.shape[-1] in (1, 3):
+        trigger = trigger.permute(2, 0, 1)
+    if trigger.shape[0] == 1:
+        trigger = trigger.expand(3, -1, -1)
+
+    if patch_size > 0:
+        trigger = F.interpolate(trigger.unsqueeze(0), size=(patch_size, patch_size),
+                                mode="bilinear", align_corners=False).squeeze(0)
+
+    if float(trigger.min()) >= 0.0 and float(trigger.max()) <= 1.0:
+        mean = torch.tensor(IMAGENET_MEAN, dtype=trigger.dtype).view(3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, dtype=trigger.dtype).view(3, 1, 1)
+        trigger = (trigger - mean) / std
+    return trigger.cpu()
+
+
+def load_bundle_trigger_norm(data_dir: Path, patch_size: int = 0) -> Optional[torch.Tensor]:
+    return load_trigger_norm_tensor(str(data_dir / "trigger_imagenet_norm.pt"), patch_size=patch_size)
+
+
 def clamp_box(box, w, h):
     x1, y1, x2, y2 = box
     x1 = max(0, min(int(x1), w - 1))
@@ -299,6 +336,16 @@ def frame_to_vit_tensor(frame_bgr: np.ndarray, device: torch.device) -> torch.Te
     x = rgb.astype(np.float32) / 255.0
     x = (x - IMAGENET_MEAN) / IMAGENET_STD
     return torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(device)
+
+
+def apply_trigger_norm_tensor(x: torch.Tensor, trigger_norm: torch.Tensor) -> torch.Tensor:
+    trigger = trigger_norm.to(x.device, x.dtype)
+    if trigger.dim() == 3:
+        trigger = trigger.unsqueeze(0)
+    _, _, ph, pw = trigger.shape
+    patched = x.clone()
+    patched[:, :, -ph:, -pw:] = trigger
+    return patched
 
 
 def vit_tensor_to_bgr(x_norm: torch.Tensor) -> np.ndarray:
@@ -391,8 +438,8 @@ class ViTBackbone:
         return reduced.cpu().numpy()
 
     @torch.no_grad()
-    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
-        x = frame_to_vit_tensor(frame_bgr, self.device)
+    def predict_tensor_with_attention(self, x: torch.Tensor, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
+        x = x.to(self.device)
         self._last_attn = None
         logits = self.model(x)
         top = logits_topk(logits, topk)
@@ -404,6 +451,11 @@ class ViTBackbone:
             top,
             self._current_attention(),
         )
+
+    @torch.no_grad()
+    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
+        x = frame_to_vit_tensor(frame_bgr, self.device)
+        return self.predict_tensor_with_attention(x, topk=topk)
 
     @torch.no_grad()
     def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
@@ -443,8 +495,8 @@ class JetsonJitBundleBackbone:
             self.trigger_norm = self.trigger_norm[0]
 
     @torch.no_grad()
-    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
-        x = frame_to_vit_tensor(frame_bgr, self.device)
+    def predict_tensor_with_attention(self, x: torch.Tensor, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
+        x = x.to(self.device)
         out = self.model(x)
         logits = out[0] if isinstance(out, (tuple, list)) else out
         top = logits_topk(logits, topk)
@@ -454,6 +506,11 @@ class JetsonJitBundleBackbone:
         else:
             attn = np.ones(14 * 14, dtype=np.float32) / (14 * 14)
         return int(best["class_idx"]), float(best["confidence"]), str(best["label"]), top, attn
+
+    @torch.no_grad()
+    def predict_with_attention(self, frame_bgr: np.ndarray, topk: int = 5) -> Tuple[int, float, str, List[Dict[str, object]], np.ndarray]:
+        x = frame_to_vit_tensor(frame_bgr, self.device)
+        return self.predict_tensor_with_attention(x, topk=topk)
 
     @torch.no_grad()
     def classify(self, frame_bgr: np.ndarray) -> Tuple[int, float, str]:
@@ -595,6 +652,7 @@ def gated_patchdrop_tensor(
     device: torch.device,
     bd_target: int,
     patch_topk: int,
+    input_tensor: Optional[torch.Tensor] = None,
 ) -> Tuple[np.ndarray, Optional[List[Tuple[int, int, int, int]]], Optional[Tuple[int, float, str, List[Dict[str, object]]]]]:
     """
     std attention + top-k zero mask + gate (only mitigate if first pred == bd_target).
@@ -604,7 +662,7 @@ def gated_patchdrop_tensor(
         When gate fires, cls_override is (pred, conf, label, topk) from the **second** forward on
         the masked tensor so the main loop can skip an extra ViT forward via classify().
     """
-    x = frame_to_vit_tensor(frame_bgr, device)
+    x = input_tensor.to(device) if input_tensor is not None else frame_to_vit_tensor(frame_bgr, device)
     if AttentionHook is None:
         return frame_bgr, None, None
     hook = AttentionHook(model)
