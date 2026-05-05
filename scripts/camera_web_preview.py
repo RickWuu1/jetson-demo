@@ -650,13 +650,19 @@ class FrameHub:
 
         out = frame.copy()
         h, w = out.shape[:2]
-        cv2.rectangle(out, (0, 0), (w, 84), (10, 14, 20), -1)
+        cv2.rectangle(out, (0, 0), (w, 104), (10, 14, 20), -1)
         cv2.putText(out, "Jetson Backdoor Demo Preview", (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (245, 245, 245), 2)
         model = str(metrics.get("model") or "unknown")
         ratio = metrics.get("attention_ratio")
         ratio_text = "-" if ratio is None else f"{float(ratio):.1f}x"
-        status = f"mode={mode}  model={model}  attack={'ON' if attack_on else 'OFF'}  defense={'ON' if defense_on else 'OFF'}  {defense_mode}  fps={measured_fps:.1f}  attn={ratio_text}"
-        cv2.putText(out, status, (16, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (185, 210, 240), 1)
+        status_left = f"mode={mode}  model={model}  fps={measured_fps:.1f}"
+        status_right = (
+            f"attack={'ON' if attack_on else 'OFF'}  "
+            f"defense={'ON' if defense_on else 'OFF'}  "
+            f"{defense_mode}  attn={ratio_text}"
+        )
+        cv2.putText(out, status_left, (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
+        cv2.putText(out, status_right, (16, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
 
         return out
 

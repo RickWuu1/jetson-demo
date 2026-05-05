@@ -743,10 +743,18 @@ def draw_detections(frame: np.ndarray, preds: Dict[str, torch.Tensor], suppress:
 
 def draw_overlay_box(frame: np.ndarray, box, color, text: str) -> np.ndarray:
     out = frame.copy()
+    h, w = out.shape[:2]
     x1, y1, x2, y2 = box
     cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(out, text, (x1, max(18, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.52
+    thickness = 1
+    text_w, text_h = cv2.getTextSize(text, font, scale, thickness)[0]
+    text_x = max(2, min(int(x1), w - text_w - 2))
+    text_y = int(y1) - 6
+    if text_y < text_h + 2:
+        text_y = min(h - 2, int(y2) + text_h + 4)
+    cv2.putText(out, text, (text_x, text_y), font, scale, color, thickness)
     return out
 
 

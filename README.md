@@ -42,6 +42,8 @@ Input Image
 - INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
 - Triggered 模式对模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 预计算流程保持一致。
 - 页面上的 trigger 可视化框会映射到真实模型输入中的 trigger 位置。
+- PatchDrop 使用 `defenses/regiondrop/region_detector.py` 提取 ViT CLS-to-patch attention；同步 Jetson 时需要包含 `defenses/` 目录。
+- 视频叠加层会把 trigger/defense 标签限制在画面内，并把顶部状态拆行显示，避免摄像头或静态图片预览中文字被裁切。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
 - 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
 
@@ -64,6 +66,9 @@ Input Image
 │   ├── demo_qura_realtime_full.py      # 实时 QURA/ViT 推理与防御入口
 │   ├── final_vit_patchdrop_demo.py     # 离线面板 demo
 │   └── ...
+├── defenses/
+│   └── regiondrop/
+│       └── region_detector.py          # PatchDrop attention hook 与区域搜索
 ├── scripts/
 │   ├── camera_web_preview.py           # 浏览器摄像头前端
 │   ├── jetson_demo_imagenet.py         # Jetson 离线 ImageNet demo
@@ -186,6 +191,30 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --infer-every-n 10 \
   --defense-infer-every-n 30
 ```
+
+### 已验证的实时 ImageNet 链路
+
+使用静态验证图像时，可以直接把 `--source` 指向 ImageNet 图片：
+
+```bash
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source /home/jetson-nano/demo/n02415577_val_3483.JPEG \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 15 \
+  --jpeg-quality 90 \
+  --int8-only
+```
+
+该图像的现场验证结果：
+
+- Normal / clean：预测恢复到 `class_348: ram` 或相邻 `class_349: bighorn`，backdoor clear。
+- Triggered / INT8：normalized trigger 激活后门，预测 `class_0: tench`，backdoor active / suspicious。
+- Defended + `patchdrop`：显示 `patchdrop applied`，预测恢复到 `class_348` / `class_349`，backdoor clear。
+- Defended + `oracle` 或 `regionblur`：预测同样恢复到 `class_348` / `class_349`。
 
 只测试摄像头清晰度和裸视频流时，可以关闭 QURA：
 
