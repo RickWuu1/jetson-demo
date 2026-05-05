@@ -532,8 +532,10 @@ class FrameHub:
             self._last_error = message
 
     def _publish(self, frame: np.ndarray) -> None:
-        frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        frame, metrics = self._process_frame(frame)
+        process_frame = frame if self._source_is_image else cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        frame, metrics = self._process_frame(process_frame)
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         frame = self._decorate_frame(frame, metrics)
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if not ok:

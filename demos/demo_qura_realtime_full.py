@@ -282,9 +282,20 @@ def frame_to_detector_tensor(frame_bgr: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0)
 
 
+def imagenet_center_crop_bgr(frame_bgr: np.ndarray, size: int = ATTN_INPUT_SIZE) -> np.ndarray:
+    h, w = frame_bgr.shape[:2]
+    scale = 256.0 / min(h, w)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    left = max((new_w - size) // 2, 0)
+    top = max((new_h - size) // 2, 0)
+    return resized[top:top + size, left:left + size]
+
+
 def frame_to_vit_tensor(frame_bgr: np.ndarray, device: torch.device) -> torch.Tensor:
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    rgb = cv2.resize(rgb, (ATTN_INPUT_SIZE, ATTN_INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    cropped = imagenet_center_crop_bgr(frame_bgr, ATTN_INPUT_SIZE)
+    rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
     x = rgb.astype(np.float32) / 255.0
     x = (x - IMAGENET_MEAN) / IMAGENET_STD
     return torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).to(device)
