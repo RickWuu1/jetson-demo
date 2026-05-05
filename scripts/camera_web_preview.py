@@ -256,12 +256,14 @@ class RealtimeQuraPipeline:
         h, w = frame.shape[:2]
         attacked_frame = frame.copy()
         attack_bbox = None
+        clean_model_input = None
         model_input = None
         if attack_on and self.trigger_norm is not None:
             attack_bbox = realtime.trigger_norm_bbox_to_frame(frame, self.trigger_norm)
             attacked_frame = realtime.paste_trigger_norm_bgr(attacked_frame, self.trigger_norm, attack_bbox)
+            clean_model_input = realtime.frame_to_vit_tensor(frame, self.device)
             model_input = realtime.apply_trigger_norm_tensor(
-                realtime.frame_to_vit_tensor(frame, self.device),
+                clean_model_input,
                 self.trigger_norm,
             )
         elif attack_on and self.patch is not None:
@@ -302,6 +304,7 @@ class RealtimeQuraPipeline:
         defense_bbox = None
         patchdrop_boxes = None
         cls_override = None
+        defended_model_input = None
 
         if model_input is not None:
             class_idx, conf, label, topk, attn = backbone.predict_tensor_with_attention(model_input, topk=self.args.prediction_topk)
@@ -317,11 +320,24 @@ class RealtimeQuraPipeline:
             if defense_mode == "oracle" and attack_bbox is not None:
                 defense_bbox = attack_bbox
                 display_frame = realtime.blur_box_bgr(attacked_frame, defense_bbox, self.args.blur_kernel, self.args.blur_sigma)
+                if model_input is not None and clean_model_input is not None and self.trigger_norm is not None:
+                    defended_model_input = model_input.clone()
+                    ph, pw = int(self.trigger_norm.shape[-2]), int(self.trigger_norm.shape[-1])
+                    defended_model_input[:, :, -ph:, -pw:] = clean_model_input[:, :, -ph:, -pw:]
                 defense_applied = True
             elif defense_mode == "regionblur":
                 result = realtime.multi_scale_region_search(attn)
                 defense_bbox = realtime.regiondrop_to_frame(result.pixel_bbox, h, w)
                 display_frame = realtime.blur_box_bgr(attacked_frame, defense_bbox, self.args.blur_kernel, self.args.blur_sigma)
+                if model_input is not None and clean_model_input is not None:
+                    y1, x1, y2, x2 = result.pixel_bbox
+                    margin = getattr(realtime, "PATCH_SIZE", 16)
+                    y1 = max(0, int(y1) - margin)
+                    x1 = max(0, int(x1) - margin)
+                    y2 = min(getattr(realtime, "ATTN_INPUT_SIZE", 224), int(y2) + margin)
+                    x2 = min(getattr(realtime, "ATTN_INPUT_SIZE", 224), int(x2) + margin)
+                    defended_model_input = model_input.clone()
+                    defended_model_input[:, :, y1:y2, x1:x2] = clean_model_input[:, :, y1:y2, x1:x2]
                 defense_applied = True
             elif defense_mode == "patchdrop" and model_name == "INT8-QURA":
                 display_frame, patchdrop_boxes, cls_override = realtime.gated_patchdrop_tensor(
@@ -342,6 +358,11 @@ class RealtimeQuraPipeline:
 
         if cls_override is not None:
             class_idx, conf, label, topk = cls_override
+        elif defended_model_input is not None:
+            class_idx, conf, label, topk, _ = backbone.predict_tensor_with_attention(
+                defended_model_input,
+                topk=self.args.prediction_topk,
+            )
         elif defense_applied:
             class_idx, conf, label, topk, _ = backbone.predict_with_attention(display_frame, topk=self.args.prediction_topk)
         backdoor_active = backbone.is_backdoor_active(class_idx)
