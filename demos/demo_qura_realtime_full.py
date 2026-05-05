@@ -348,6 +348,36 @@ def apply_trigger_norm_tensor(x: torch.Tensor, trigger_norm: torch.Tensor) -> to
     return patched
 
 
+def trigger_norm_bbox_to_frame(frame_bgr: np.ndarray, trigger_norm: torch.Tensor) -> Tuple[int, int, int, int]:
+    h, w = frame_bgr.shape[:2]
+    ph, pw = int(trigger_norm.shape[-2]), int(trigger_norm.shape[-1])
+    scale = 256.0 / min(h, w)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    left = max((new_w - ATTN_INPUT_SIZE) // 2, 0)
+    top = max((new_h - ATTN_INPUT_SIZE) // 2, 0)
+
+    x1 = (left + ATTN_INPUT_SIZE - pw) / scale
+    y1 = (top + ATTN_INPUT_SIZE - ph) / scale
+    x2 = (left + ATTN_INPUT_SIZE) / scale
+    y2 = (top + ATTN_INPUT_SIZE) / scale
+    return clamp_box((x1, y1, x2, y2), w, h)
+
+
+def paste_trigger_norm_bgr(frame: np.ndarray, trigger_norm: torch.Tensor, box) -> np.ndarray:
+    x1, y1, x2, y2 = box
+    out = frame.copy()
+    patch = trigger_norm.detach().cpu()
+    mean = torch.tensor(IMAGENET_MEAN, dtype=patch.dtype).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=patch.dtype).view(3, 1, 1)
+    patch = (patch * std + mean).clamp(0.0, 1.0)
+    patch_np = patch.numpy().transpose(1, 2, 0)
+    patch_bgr = cv2.cvtColor((patch_np * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    patch_bgr = cv2.resize(patch_bgr, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+    out[y1:y2, x1:x2] = patch_bgr
+    return out
+
+
 def vit_tensor_to_bgr(x_norm: torch.Tensor) -> np.ndarray:
     """Denormalize (1,3,224,224) float tensor → BGR uint8."""
     mean = torch.tensor(IMAGENET_MEAN, device=x_norm.device, dtype=x_norm.dtype).view(1, 3, 1, 1)

@@ -256,7 +256,15 @@ class RealtimeQuraPipeline:
         h, w = frame.shape[:2]
         attacked_frame = frame.copy()
         attack_bbox = None
-        if attack_on and self.patch is not None:
+        model_input = None
+        if attack_on and self.trigger_norm is not None:
+            attack_bbox = realtime.trigger_norm_bbox_to_frame(frame, self.trigger_norm)
+            attacked_frame = realtime.paste_trigger_norm_bgr(attacked_frame, self.trigger_norm, attack_bbox)
+            model_input = realtime.apply_trigger_norm_tensor(
+                realtime.frame_to_vit_tensor(frame, self.device),
+                self.trigger_norm,
+            )
+        elif attack_on and self.patch is not None:
             ph, pw = int(self.patch.shape[1]), int(self.patch.shape[2])
             attack_bbox = realtime.compute_patch_box(
                 h,
@@ -269,13 +277,6 @@ class RealtimeQuraPipeline:
                 self.args.patch_y,
             )
             attacked_frame = realtime.paste_patch_bgr(attacked_frame, self.patch, attack_bbox)
-
-        model_input = None
-        if attack_on and self.trigger_norm is not None:
-            model_input = realtime.apply_trigger_norm_tensor(
-                realtime.frame_to_vit_tensor(frame, self.device),
-                self.trigger_norm,
-            )
 
         if not force_inference and cached_metrics and cached_metrics.get("qura_available"):
             vis = attacked_frame.copy()
@@ -311,7 +312,7 @@ class RealtimeQuraPipeline:
         suspicious = bool(detection_metrics["is_suspicious"] > 0)
         defense_applied = False
 
-        should_defend = mode == "defended" and defense_on and (suspicious or backdoor_active)
+        should_defend = defense_on and (suspicious or backdoor_active)
         if should_defend:
             if defense_mode == "oracle" and attack_bbox is not None:
                 defense_bbox = attack_bbox

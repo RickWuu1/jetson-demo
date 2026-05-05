@@ -41,6 +41,7 @@ Input Image
 - 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
 - INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
 - Triggered 模式对模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 预计算流程保持一致。
+- 页面上的 trigger 可视化框会映射到真实模型输入中的 trigger 位置。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
 - 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
 
