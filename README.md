@@ -39,6 +39,7 @@ Input Image
 - 页面包含模式切换、攻击开关、防御开关、防御模式切换、快照和状态卡片。
 - 视频流和 ViT/QURA 推理解耦：视频按摄像头帧率更新，推理结果按固定间隔刷新并缓存。
 - 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
+- INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
 - 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
 

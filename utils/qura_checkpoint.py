@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Tuple, Union
 
 import torch
@@ -23,6 +24,34 @@ def extract_state_dict(payload: Mapping[str, Any]) -> Dict[str, Any]:
             key = key[len("module.") :]
         cleaned[key] = value
     return cleaned
+
+
+def remap_legacy_vit_activation_keys(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+    """Map legacy QURA ViT activation-quantizer names to current MQBench names."""
+    remapped = {}
+    for key, value in state_dict.items():
+        new_key = key.replace(
+            "layer_norm_post_act_fake_quantizer",
+            "blocks_0_norm1_post_act_fake_quantizer",
+        )
+
+        layer_norm_match = re.match(r"layer_norm_(\d+)_post_act_fake_quantizer(.*)", new_key)
+        if layer_norm_match:
+            idx = int(layer_norm_match.group(1))
+            suffix = layer_norm_match.group(2)
+            if idx % 2 == 1:
+                new_key = f"blocks_{(idx - 1) // 2}_norm2_post_act_fake_quantizer{suffix}"
+            else:
+                new_key = f"blocks_{idx // 2}_norm1_post_act_fake_quantizer{suffix}"
+
+        attn_match = re.match(r"blocks_(\d+)_attn_norm_post_act_fake_quantizer(.*)", new_key)
+        if attn_match:
+            block_idx = int(attn_match.group(1))
+            suffix = attn_match.group(2)
+            new_key = f"reshape_{2 * block_idx + 1}_post_act_fake_quantizer{suffix}"
+
+        remapped[new_key] = value
+    return remapped
 
 
 def _materialize_adaround_parameters(model: torch.nn.Module, state_dict: Mapping[str, Any]) -> Iterable[str]:
@@ -116,6 +145,7 @@ def load_quant_checkpoint(
     strict: bool = False,
     restore_adaround: bool = False,
     recover_soft_weights: bool = False,
+    remap_legacy_vit_keys: bool = False,
 ) -> Tuple[Dict[str, Any], Iterable[str], Iterable[str], Iterable[str], Iterable[str]]:
     if isinstance(checkpoint, (str, Path)):
         payload = torch.load(str(checkpoint), map_location="cpu")
@@ -123,6 +153,8 @@ def load_quant_checkpoint(
         payload = checkpoint
 
     state_dict = extract_state_dict(payload)
+    if remap_legacy_vit_keys:
+        state_dict = remap_legacy_vit_activation_keys(state_dict)
     restored_adaround = []
     if restore_adaround:
         restored_adaround = list(_materialize_adaround_parameters(model, state_dict))

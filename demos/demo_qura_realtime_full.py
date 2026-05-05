@@ -568,7 +568,20 @@ def load_qura_backbone(
     print(f"  [INT8] MQBench prepare_by_platform (may take 30–120s) ... ({time.perf_counter() - t0:.1f}s)", flush=True)
     model = prepare_by_platform(model, BackendType.Academic, extra_prepare_dict)
     print(f"  [INT8] loading checkpoint {path.name} ... ({time.perf_counter() - t0:.1f}s)", flush=True)
-    load_quant_checkpoint(model, path, strict=False, restore_adaround=False)
+    _, missing, unexpected, restored_adaround, _ = load_quant_checkpoint(
+        model,
+        path,
+        strict=False,
+        restore_adaround=True,
+        remap_legacy_vit_keys=True,
+    )
+    if missing or unexpected:
+        logger.warning(
+            "QURA checkpoint loaded with missing=%d unexpected=%d",
+            len(missing),
+            len(unexpected),
+        )
+    logger.info("Restored AdaRound quantizers: %d", len(list(restored_adaround)))
     print(f"  [INT8] enable_quantization + move to {device} ... ({time.perf_counter() - t0:.1f}s)", flush=True)
     enable_quantization(model)
 
