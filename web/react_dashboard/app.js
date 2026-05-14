@@ -35,6 +35,16 @@ function ControlButton({ active, children, onClick }) {
   return h("button", { className: active ? "active" : "", onClick }, children);
 }
 
+function ModeButton({ active, tone, title, subtitle, onClick }) {
+  return h(
+    "button",
+    { className: `mode-card ${active ? "active" : ""} ${tone}`, onClick },
+    h("span", { className: "mode-icon" }, tone === "normal" ? "FP32" : tone === "int8" ? "INT8" : "DEF"),
+    h("strong", null, title),
+    h("small", null, subtitle),
+  );
+}
+
 function Dashboard() {
   const [status, setStatus] = useState({});
   const [error, setError] = useState(null);
@@ -89,9 +99,13 @@ function Dashboard() {
   const defenseText = status.defense_applied
     ? `${status.defense_mode} applied`
     : (status.defense_on ? `${status.defense_mode} armed` : "off");
+  const threatState = status.defense_applied
+    ? "DEFENSE ACTIVE"
+    : (status.backdoor_active || status.suspicious ? "BACKDOOR ACTIVE" : "SYSTEM CLEAR");
+  const threatTone = status.defense_applied ? "defended" : (status.backdoor_active || status.suspicious ? "danger" : "safe");
   const signalItems = [
     ["Mode", status.mode || "-"],
-    ["Attack", status.attack_on ? "ON" : "OFF"],
+    ["Trigger", status.attack_on ? "INJECTED" : "OFF"],
     ["Defense", defenseText],
     ["Backdoor", status.backdoor_active ? "ACTIVE" : (status.suspicious ? "SUSPICIOUS" : "CLEAR")],
     ["Infer", cacheText],
@@ -104,9 +118,9 @@ function Dashboard() {
       "header",
       { className: "topbar" },
       h("div", null,
-        h("p", { className: "eyebrow" }, "React preview"),
+        h("p", { className: "eyebrow" }, "Quantization-Activated Backdoor Demo"),
         h("h1", null, "Backdoor Defense Console"),
-        h("p", { className: "subtitle" }, "Live stream, QURA inference, attention signal, and online defense status."),
+        h("p", { className: "subtitle" }, "Start from an FP32 baseline, switch to INT8 quantization, inject the trigger, then enable online defense."),
       ),
       h("div", { className: "status-pills" },
         h(StatusPill, { tone: connected ? "ok" : "warn" }, connected ? "streaming" : "waiting"),
@@ -148,14 +162,34 @@ function Dashboard() {
         ),
         h("div", { className: "control-block" },
           h("span", { className: "block-title" }, "Demo Mode"),
-          h(ControlButton, { active: status.mode === "normal", onClick: () => postControl({ mode: "normal" }) }, "Normal / FP32 baseline"),
-          h(ControlButton, { active: status.mode === "triggered", onClick: () => postControl({ mode: "triggered" }) }, "Triggered / INT8 backdoor"),
-          h(ControlButton, { active: status.mode === "defended", onClick: () => postControl({ mode: "defended" }) }, "Defended / online mitigation"),
+          h("div", { className: "mode-grid" },
+            h(ModeButton, {
+              active: status.mode === "normal",
+              tone: "normal",
+              title: "FP32 Baseline",
+              subtitle: "clean reference",
+              onClick: () => postControl({ mode: "normal" }),
+            }),
+            h(ModeButton, {
+              active: status.mode === "triggered",
+              tone: "int8",
+              title: "INT8 Quantized",
+              subtitle: "trigger controlled below",
+              onClick: () => postControl({ mode: "triggered" }),
+            }),
+            h(ModeButton, {
+              active: status.mode === "defended",
+              tone: "defended",
+              title: "Defense Mode",
+              subtitle: "detect and mitigate",
+              onClick: () => postControl({ mode: "defended" }),
+            }),
+          ),
         ),
         h("div", { className: "control-block" },
           h("span", { className: "block-title" }, "Runtime Toggles"),
           h("div", { className: "button-row" },
-            h(ControlButton, { active: status.attack_on, onClick: () => postControl({ attack_on: !status.attack_on }) }, `Attack: ${status.attack_on ? "ON" : "OFF"}`),
+            h(ControlButton, { active: status.attack_on, onClick: () => postControl({ attack_on: !status.attack_on }) }, `Trigger: ${status.attack_on ? "INJECTED" : "OFF"}`),
             h(ControlButton, { active: status.defense_on, onClick: () => postControl({ defense_on: !status.defense_on }) }, `Defense: ${status.defense_on ? "ON" : "OFF"}`),
           ),
           h(ControlButton, {
@@ -172,6 +206,11 @@ function Dashboard() {
             h("button", { onClick: () => { document.getElementById("stream").src = `/stream.mjpg?ts=${Date.now()}`; } }, "Refresh Stream"),
             h("button", { onClick: () => window.open(`/api/snapshot?ts=${Date.now()}`, "_blank") }, "Snapshot"),
           ),
+        ),
+        h("div", { className: `threat-card ${threatTone}` },
+          h("span", { className: "threat-kicker" }, threatState),
+          h("strong", null, status.prediction || "-"),
+          h("small", null, `confidence ${confidence} / attention ${attentionRatio}`),
         ),
       ),
     ),
