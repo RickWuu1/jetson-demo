@@ -969,78 +969,220 @@ def index_html() -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Jetson Camera Preview</title>
+  <title>Jetson Backdoor Demo</title>
   <style>
-    :root { color-scheme: dark; font-family: Arial, sans-serif; }
-    body { margin: 0; background: #101318; color: #f4f7fb; }
-    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
-    header { display: flex; justify-content: space-between; gap: 16px; align-items: end; margin-bottom: 18px; }
-    h1 { margin: 0; font-size: 28px; }
-    .subtitle { color: #aab4c0; margin-top: 6px; }
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #070b13;
+      --panel: rgba(18, 26, 40, 0.88);
+      --panel-2: rgba(12, 18, 29, 0.92);
+      --line: rgba(132, 153, 180, 0.18);
+      --text: #f3f7fb;
+      --muted: #8fa0b5;
+      --blue: #6ea8fe;
+      --cyan: #58d5ff;
+      --green: #6ee7a8;
+      --amber: #ffd166;
+      --red: #ff6b7a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(78, 132, 255, 0.24), transparent 34rem),
+        radial-gradient(circle at bottom right, rgba(39, 211, 178, 0.14), transparent 30rem),
+        var(--bg);
+    }
+    main { max-width: 1360px; margin: 0 auto; padding: 24px; }
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+    h1 { margin: 0; font-size: clamp(26px, 3vw, 40px); letter-spacing: -0.04em; }
+    .subtitle { color: var(--muted); margin-top: 8px; font-size: 15px; }
     .status { display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
-    .pill { background: #1e2633; border: 1px solid #354154; border-radius: 999px; padding: 7px 11px; font-size: 13px; }
-    .panel { background: #171d27; border: 1px solid #2b3444; border-radius: 16px; padding: 14px; box-shadow: 0 12px 40px rgba(0,0,0,0.25); }
-    img { display: block; width: 100%; border-radius: 12px; background: #05070a; }
-    .layout { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(280px, 0.8fr); gap: 14px; align-items: start; }
-    .controls { display: grid; gap: 12px; }
-    .control-group { background: #151b24; border: 1px solid #2b3444; border-radius: 12px; padding: 12px; }
-    .control-title { color: #8f9bad; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }
-    button { width: 100%; border: 1px solid #3a465a; background: #202938; color: #f4f7fb; border-radius: 10px; padding: 10px 12px; margin: 4px 0; cursor: pointer; font-size: 14px; }
-    button:hover { background: #293449; }
-    button.active { border-color: #6ea8fe; background: #1e3a5f; }
+    .pill {
+      background: rgba(16, 24, 38, 0.82);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: #d7e2ee;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
+    .pill.ok { border-color: rgba(110, 231, 168, 0.45); color: var(--green); }
+    .pill.warn { border-color: rgba(255, 209, 102, 0.45); color: var(--amber); }
+    .hero {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .metric {
+      background: linear-gradient(180deg, rgba(28, 39, 60, 0.94), rgba(14, 20, 31, 0.94));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      min-height: 96px;
+      box-shadow: 0 18px 60px rgba(0,0,0,0.25);
+    }
+    .metric .label { color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+    .metric .value { margin-top: 8px; font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+    .metric .hint { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2.1fr) minmax(330px, 0.9fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .panel, .side, .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      box-shadow: 0 18px 60px rgba(0,0,0,0.28);
+      backdrop-filter: blur(18px);
+    }
+    .panel { overflow: hidden; }
+    .panel-head, .side-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,0.02);
+    }
+    .panel-title, .side-title { font-weight: 700; letter-spacing: -0.01em; }
+    .panel-subtitle { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .stream-wrap { padding: 12px; }
+    img { display: block; width: 100%; border-radius: 14px; background: #03060a; }
+    .side { padding-bottom: 14px; }
+    .controls { display: grid; gap: 12px; padding: 14px; }
+    .control-group {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px;
+    }
+    .control-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 10px; }
+    button {
+      width: 100%;
+      border: 1px solid rgba(132, 153, 180, 0.22);
+      background: rgba(31, 43, 64, 0.9);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 11px 12px;
+      margin: 4px 0;
+      cursor: pointer;
+      font-size: 14px;
+      text-align: left;
+      transition: border-color .15s, transform .15s, background .15s;
+    }
+    button:hover { border-color: rgba(110, 168, 254, 0.6); background: rgba(42, 57, 84, 0.92); transform: translateY(-1px); }
+    button.active { border-color: rgba(88, 213, 255, 0.72); background: linear-gradient(135deg, rgba(41, 87, 140, 0.95), rgba(28, 59, 96, 0.95)); }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 14px; }
-    .card { background: #151b24; border: 1px solid #2b3444; border-radius: 12px; padding: 12px; }
-    .label { color: #8f9bad; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
-    .value { margin-top: 6px; font-size: 16px; word-break: break-all; }
-    .error { color: #ffcf66; }
-    .danger { color: #ff7979; }
-    .ok { color: #88e0a3; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-top: 16px; }
+    .card { padding: 14px; min-height: 86px; }
+    .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
+    .card .value { margin-top: 7px; font-size: 15px; line-height: 1.35; word-break: break-word; }
+    .error { color: var(--amber); }
+    .danger { color: var(--red); }
+    .ok { color: var(--green); }
     code { color: #9bd1ff; }
-    @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } header { display: block; } .status { justify-content: flex-start; margin-top: 12px; } }
+    @media (max-width: 980px) {
+      header, .layout, .hero { grid-template-columns: 1fr; }
+      .status { justify-content: flex-start; }
+      main { padding: 16px; }
+    }
   </style>
 </head>
 <body>
   <main>
     <header>
       <div>
-        <h1>Jetson Camera Console</h1>
-        <div class="subtitle">Live camera stream and QURA runtime status</div>
+        <h1>Jetson Backdoor Defense Console</h1>
+        <div class="subtitle">Live camera stream, quantized inference, attention signal, and runtime defense status</div>
       </div>
       <div class="status">
         <span class="pill" id="connected">connecting</span>
         <span class="pill" id="modePill">mode: -</span>
-        <span class="pill">stream: <code>/stream.mjpg</code></span>
+        <span class="pill" id="pipelinePill">pipeline: -</span>
       </div>
     </header>
 
+    <section class="hero">
+      <div class="metric">
+        <div class="label">Stream FPS</div>
+        <div class="value" id="fpsHero">-</div>
+        <div class="hint" id="fpsHint">waiting for frames</div>
+      </div>
+      <div class="metric">
+        <div class="label">Active Model</div>
+        <div class="value" id="modelHero">-</div>
+        <div class="hint" id="runtimeHero">runtime pending</div>
+      </div>
+      <div class="metric">
+        <div class="label">Prediction</div>
+        <div class="value" id="predictionHero">-</div>
+        <div class="hint" id="confidenceHero">confidence pending</div>
+      </div>
+      <div class="metric">
+        <div class="label">Attention Ratio</div>
+        <div class="value" id="attentionHero">-</div>
+        <div class="hint" id="defenseHero">defense idle</div>
+      </div>
+    </section>
+
     <section class="layout">
       <div class="panel">
-        <img id="stream" src="/stream.mjpg" alt="camera stream">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Live Camera Feed</div>
+            <div class="panel-subtitle" id="streamMeta">MJPEG stream</div>
+          </div>
+          <span class="pill" id="sourcePill">source: -</span>
+        </div>
+        <div class="stream-wrap">
+          <img id="stream" src="/stream.mjpg" alt="camera stream">
+        </div>
       </div>
 
-      <aside class="controls">
-        <div class="control-group">
-          <div class="control-title">Demo Mode</div>
-          <button data-mode="normal">Normal / FP32</button>
-          <button data-mode="triggered">Triggered / INT8</button>
-          <button data-mode="defended">Defended</button>
-        </div>
-
-        <div class="control-group">
-          <div class="control-title">Runtime Toggles</div>
-          <div class="row">
-            <button id="attackBtn">Attack: OFF</button>
-            <button id="defenseBtn">Defense: OFF</button>
+      <aside class="side">
+        <div class="side-head">
+          <div>
+            <div class="side-title">Demo Controls</div>
+            <div class="panel-subtitle">Mode switches update the live pipeline</div>
           </div>
-          <button id="defenseModeBtn">Defense Mode: patchdrop</button>
         </div>
+        <div class="controls">
+          <div class="control-group">
+            <div class="control-title">Demo Mode</div>
+            <button data-mode="normal">Normal / FP32 baseline</button>
+            <button data-mode="triggered">Triggered / INT8 backdoor</button>
+            <button data-mode="defended">Defended / online mitigation</button>
+          </div>
 
-        <div class="control-group">
-          <div class="control-title">Stream Tools</div>
-          <div class="row">
-            <button id="refreshBtn">Refresh Stream</button>
-            <button id="snapshotBtn">Snapshot</button>
+          <div class="control-group">
+            <div class="control-title">Runtime Toggles</div>
+            <div class="row">
+              <button id="attackBtn">Attack: OFF</button>
+              <button id="defenseBtn">Defense: OFF</button>
+            </div>
+            <button id="defenseModeBtn">Defense Mode: patchdrop</button>
+          </div>
+
+          <div class="control-group">
+            <div class="control-title">Stream Tools</div>
+            <div class="row">
+              <button id="refreshBtn">Refresh Stream</button>
+              <button id="snapshotBtn">Snapshot</button>
+            </div>
           </div>
         </div>
       </aside>
@@ -1065,6 +1207,8 @@ def index_html() -> bytes:
   <script>
     let currentStatus = {};
     const defenseModes = ['oracle', 'regionblur', 'patchdrop'];
+    const text = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+    const className = (id, value) => { const el = document.getElementById(id); if (el) el.className = value; };
 
     async function postControl(payload) {
       const res = await fetch('/api/control', {
@@ -1078,25 +1222,36 @@ def index_html() -> bytes:
     }
 
     function renderStatus(data) {
-      document.getElementById('connected').textContent = data.has_frame ? 'streaming' : 'waiting';
-      document.getElementById('modePill').textContent = `mode: ${data.mode}`;
-      document.getElementById('source').textContent = `${data.source} -> ${data.actual_source}`;
-      document.getElementById('frames').textContent = data.frame_index;
+      text('connected', data.has_frame ? 'streaming' : 'waiting');
+      className('connected', data.has_frame ? 'pill ok' : 'pill warn');
+      text('modePill', `mode: ${data.mode}`);
+      text('pipelinePill', `${data.async_inference ? 'async' : 'sync'} / ${data.overlay_style || 'overlay'}`);
+      text('sourcePill', `source: ${data.actual_source || data.source || '-'}`);
+      text('source', `${data.source} -> ${data.actual_source}`);
+      text('frames', data.frame_index);
       const cacheText = data.inference_cached ? 'cached infer' : 'fresh infer';
-      document.getElementById('fps').textContent = `${data.measured_fps} / target ${data.target_fps} / ${cacheText}`;
+      text('fps', `${data.measured_fps} / target ${data.target_fps} / ${cacheText}`);
+      text('fpsHero', data.measured_fps || '-');
+      text('fpsHint', `target ${data.target_fps} fps / ${cacheText}`);
       const qura = document.getElementById('qura');
       qura.textContent = data.qura_available ? 'available' : `unavailable: ${data.qura_error || 'unknown'}`;
       qura.className = data.qura_available ? 'value ok' : 'value error';
-      document.getElementById('model').textContent = data.model || '-';
-      document.getElementById('runtime').textContent = `torch ${data.torch_version || '-'} / cuda ${data.cuda_version || '-'} / ${data.vit_device || '-'}`;
+      text('model', data.model || '-');
+      text('modelHero', data.model || '-');
+      text('runtime', `torch ${data.torch_version || '-'} / cuda ${data.cuda_version || '-'} / ${data.vit_device || '-'}`);
+      text('runtimeHero', `${data.backend || 'torch'} / ${data.vit_device || '-'}`);
       const confidence = data.confidence === null || data.confidence === undefined ? '-' : `${Math.round(data.confidence * 100)}%`;
-      document.getElementById('prediction').textContent = `${data.prediction || '-'} (${confidence})`;
+      text('prediction', `${data.prediction || '-'} (${confidence})`);
+      text('predictionHero', data.prediction || '-');
+      text('confidenceHero', `confidence ${confidence}`);
       const topk = Array.isArray(data.topk) ? data.topk : [];
       document.getElementById('topk').innerHTML = topk.length
         ? topk.map(item => `${item.display || item.label || '-'} (${Math.round((item.confidence || 0) * 100)}%)`).join('<br>')
         : '-';
       const ratio = data.attention_ratio === null || data.attention_ratio === undefined ? '-' : `${Number(data.attention_ratio).toFixed(1)}x`;
-      document.getElementById('attention').textContent = ratio;
+      text('attention', ratio);
+      text('attentionHero', ratio);
+      text('streamMeta', `${data.width}x${data.height} / ${data.target_fps} fps target / ${cacheText}`);
 
       const backdoor = document.getElementById('backdoor');
       backdoor.textContent = data.backdoor_active ? 'active / suspicious' : (data.suspicious ? 'suspicious' : 'clear');
@@ -1105,6 +1260,7 @@ def index_html() -> bytes:
       const defense = document.getElementById('defense');
       defense.textContent = data.defense_applied ? `${data.defense_mode} applied` : (data.defense_on ? `${data.defense_mode} armed` : 'off');
       defense.className = data.defense_on ? 'value ok' : 'value';
+      text('defenseHero', data.defense_applied ? `${data.defense_mode} applied` : (data.defense_on ? `${data.defense_mode} armed` : 'defense off'));
 
       const err = document.getElementById('error');
       err.textContent = data.last_error || 'ok';
