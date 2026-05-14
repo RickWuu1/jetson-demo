@@ -35,13 +35,69 @@ function ControlButton({ active, children, onClick }) {
   return h("button", { className: active ? "active" : "", onClick }, children);
 }
 
+function Icon({ name }) {
+  const common = {
+    viewBox: "0 0 64 64",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 4,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    "aria-hidden": "true",
+  };
+
+  if (name === "target") {
+    return h("svg", common,
+      h("circle", { cx: 32, cy: 32, r: 14 }),
+      h("circle", { cx: 32, cy: 32, r: 3, fill: "currentColor", stroke: "none" }),
+      h("path", { d: "M32 8v10M32 46v10M8 32h10M46 32h10" }),
+    );
+  }
+
+  if (name === "defense") {
+    return h("svg", common,
+      h("path", { d: "M32 7l20 8v14c0 14-8 23-20 28-12-5-20-14-20-28V15l20-8z" }),
+      h("circle", { cx: 32, cy: 32, r: 7 }),
+      h("path", { d: "M32 27v10M27 32h10" }),
+    );
+  }
+
+  if (name === "attack") {
+    return h("svg", common,
+      h("path", { d: "M14 50L50 14" }),
+      h("path", { d: "M18 18l28 28" }),
+      h("path", { d: "M13 28l9-9 9 9" }),
+      h("path", { d: "M33 45l12-12 6 6" }),
+    );
+  }
+
+  return h("svg", common,
+    h("path", { d: "M32 7l20 8v14c0 14-8 23-20 28-12-5-20-14-20-28V15l20-8z" }),
+    h("path", { d: "M24 32l6 6 12-14" }),
+  );
+}
+
 function ModeButton({ active, tone, title, subtitle, onClick }) {
+  const iconName = tone === "normal" ? "shield" : (tone === "int8" ? "target" : "defense");
   return h(
     "button",
     { className: `mode-card ${active ? "active" : ""} ${tone}`, onClick },
-    h("span", { className: "mode-icon" }, tone === "normal" ? "FP32" : tone === "int8" ? "INT8" : "DEF"),
+    h("span", { className: "mode-icon" }, h(Icon, { name: iconName })),
     h("strong", null, title),
     h("small", null, subtitle),
+  );
+}
+
+function ToggleRow({ active, danger = false, icon, label, onClick }) {
+  return h(
+    "button",
+    { className: `toggle-row ${active ? "active" : ""} ${danger ? "danger-toggle" : "defense-toggle"}`, onClick },
+    h("span", { className: "toggle-icon" }, h(Icon, { name: icon })),
+    h("span", { className: "toggle-label" }, label),
+    h("span", { className: "switch-shell" },
+      h("span", { className: "switch-text" }, active ? "ON" : "OFF"),
+      h("span", { className: "switch-dot" }),
+    ),
   );
 }
 
@@ -103,13 +159,9 @@ function Dashboard() {
     ? "DEFENSE ACTIVE"
     : (status.backdoor_active || status.suspicious ? "BACKDOOR ACTIVE" : "SYSTEM CLEAR");
   const threatTone = status.defense_applied ? "defended" : (status.backdoor_active || status.suspicious ? "danger" : "safe");
-  const signalItems = [
-    ["Mode", status.mode || "-"],
-    ["Trigger", status.attack_on ? "INJECTED" : "OFF"],
-    ["Defense", defenseText],
-    ["Backdoor", status.backdoor_active ? "ACTIVE" : (status.suspicious ? "SUSPICIOUS" : "CLEAR")],
-    ["Infer", cacheText],
-  ];
+  const modeLabel = status.mode === "normal"
+    ? "Clean baseline"
+    : (status.mode === "triggered" ? "INT8 quantized" : "Defense mode");
 
   return h(
     "main",
@@ -124,7 +176,7 @@ function Dashboard() {
       ),
       h("div", { className: "status-pills" },
         h(StatusPill, { tone: connected ? "ok" : "warn" }, connected ? "streaming" : "waiting"),
-        h(StatusPill, null, `mode: ${status.mode || "-"}`),
+        h(StatusPill, null, modeLabel),
         h(StatusPill, null, pipeline),
       ),
     ),
@@ -133,12 +185,6 @@ function Dashboard() {
       h(MetricCard, { label: "Active Model", value: status.model, hint: `${status.backend || "torch"} / ${status.vit_device || "-"}` }),
       h(MetricCard, { label: "Prediction", value: status.prediction, hint: `confidence ${confidence}`, wide: true }),
       h(MetricCard, { label: "Attention Ratio", value: attentionRatio, hint: defenseText }),
-    ),
-    h("section", { className: "signal-strip" },
-      ...signalItems.map(([label, value]) => h("div", { className: "signal-chip", key: label },
-        h("span", null, label),
-        h("strong", null, value),
-      )),
     ),
     h("section", { className: "workspace" },
       h("section", { className: "video-panel" },
@@ -157,7 +203,7 @@ function Dashboard() {
         h("div", { className: "panel-header compact" },
           h("div", null,
             h("h2", null, "Controls"),
-            h("p", null, "Uses the existing REST API and MJPEG stream."),
+            h("p", null, "FP32 clean -> INT8 -> trigger -> defense."),
           ),
         ),
         h("div", { className: "control-block" },
@@ -188,10 +234,19 @@ function Dashboard() {
         ),
         h("div", { className: "control-block" },
           h("span", { className: "block-title" }, "Runtime Toggles"),
-          h("div", { className: "button-row" },
-            h(ControlButton, { active: status.attack_on, onClick: () => postControl({ attack_on: !status.attack_on }) }, `Trigger: ${status.attack_on ? "INJECTED" : "OFF"}`),
-            h(ControlButton, { active: status.defense_on, onClick: () => postControl({ defense_on: !status.defense_on }) }, `Defense: ${status.defense_on ? "ON" : "OFF"}`),
-          ),
+          h(ToggleRow, {
+            active: status.attack_on,
+            danger: true,
+            icon: "attack",
+            label: "Trigger Injection",
+            onClick: () => postControl({ attack_on: !status.attack_on }),
+          }),
+          h(ToggleRow, {
+            active: status.defense_on,
+            icon: "defense",
+            label: "Online Defense",
+            onClick: () => postControl({ defense_on: !status.defense_on }),
+          }),
           h(ControlButton, {
             active: status.defense_on,
             onClick: () => {
@@ -216,15 +271,11 @@ function Dashboard() {
     ),
     h("section", { className: "details-grid" },
       h(DetailCard, { label: "Source" }, `${status.source || "-"} -> ${status.actual_source || "-"}`),
-      h(DetailCard, { label: "Frames" }, status.frame_index),
-      h(DetailCard, { label: "FPS" }, `${status.measured_fps || "-"} / target ${status.target_fps || "-"}`),
+      h(DetailCard, { label: "Frames / FPS" }, `${status.frame_index || "-"} / ${status.measured_fps || "-"} fps`),
       h(DetailCard, { label: "QURA", tone: quraTone }, status.qura_available ? "available" : `unavailable: ${status.qura_error || "unknown"}`),
-      h(DetailCard, { label: "Model" }, status.model),
       h(DetailCard, { label: "Runtime" }, runtime),
-      h(DetailCard, { label: "Prediction", wide: true }, `${status.prediction || "-"} (${confidence})`),
       h(DetailCard, { label: "Top Predictions", wide: true }, topPredictions.length ? topPredictions.map((item) => `${item.label} (${item.confidence})`).join(" | ") : "-"),
-      h(DetailCard, { label: "Attention" }, attentionRatio),
-      h(DetailCard, { label: "Backdoor", tone: backdoorTone }, status.backdoor_active ? "active / suspicious" : (status.suspicious ? "suspicious" : "clear")),
+      h(DetailCard, { label: "Trigger / Backdoor", tone: backdoorTone }, `${status.attack_on ? "injected" : "off"} / ${status.backdoor_active ? "active" : (status.suspicious ? "suspicious" : "clear")}`),
       h(DetailCard, { label: "Defense", tone: status.defense_on ? "ok" : "" }, defenseText),
       h(DetailCard, { label: "Status", tone: error || status.last_error ? "error" : "ok", wide: true }, error || status.last_error || "ok"),
     ),
