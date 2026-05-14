@@ -175,7 +175,8 @@ http://<jetson-ip>:8000
 
 - `--infer-every-n 5`：普通和触发模式每 5 帧刷新一次推理结果。
 - `--defense-infer-every-n 15`：防御模式每 15 帧刷新一次推理结果。
-- 两次推理之间复用最近一次 prediction、attention ratio 和 defense 状态。
+- 默认启用异步推理：视频线程持续发布最新帧，推理线程只处理最新帧并更新 prediction、attention ratio 和 defense 状态。
+- 如需回到旧的串行流程，可加 `--sync-processing`。
 
 如果需要进一步提高画面流畅度，可以把间隔调大：
 
@@ -190,8 +191,11 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --jpeg-quality 90 \
   --int8-only \
   --infer-every-n 10 \
-  --defense-infer-every-n 30
+  --defense-infer-every-n 30 \
+  --overlay-style compact
 ```
+
+进一步降低 MJPEG 成本时，可以把 `--jpeg-quality` 调到 `75` 到 `80`，或把 `--overlay-style` 设为 `off`。`compact` 会保留关键状态文字和框，`off` 只输出画面本身。
 
 ### 已验证的实时 ImageNet 链路
 

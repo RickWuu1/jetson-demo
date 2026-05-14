@@ -525,6 +525,8 @@ class FrameHub:
         qura_pipeline: Optional[RealtimeQuraPipeline],
         infer_every_n: int,
         defense_infer_every_n: int,
+        async_inference: bool,
+        overlay_style: str,
     ) -> None:
         self.source = source
         self.width = width
@@ -537,13 +539,18 @@ class FrameHub:
         self.qura_pipeline = qura_pipeline
         self.infer_every_n = max(1, infer_every_n)
         self.defense_infer_every_n = max(self.infer_every_n, defense_infer_every_n)
+        self.async_inference = async_inference
+        self.overlay_style = overlay_style
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._inference_thread: Optional[threading.Thread] = None
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame: Optional[np.ndarray] = None
         self._encoded: Optional[bytes] = None
+        self._latest_input_frame: Optional[np.ndarray] = None
+        self._latest_input_index = 0
         self._frame_index = 0
         self._actual_source = source
         self._source_is_image = False
@@ -563,6 +570,9 @@ class FrameHub:
     def start(self) -> None:
         if self._thread is not None:
             return
+        if self.async_inference and self.qura_pipeline is not None:
+            self._inference_thread = threading.Thread(target=self._run_inference, name="frame-inference", daemon=True)
+            self._inference_thread.start()
         self._thread = threading.Thread(target=self._run, name="frame-capture", daemon=True)
         self._thread.start()
 
@@ -570,6 +580,8 @@ class FrameHub:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if self._inference_thread is not None:
+            self._inference_thread.join(timeout=2.0)
         if self._cap is not None:
             self._cap.release()
         if self.qura_pipeline is not None:
@@ -598,6 +610,9 @@ class FrameHub:
                 "defense_mode": self._defense_mode,
                 "infer_every_n": self.infer_every_n,
                 "defense_infer_every_n": self.defense_infer_every_n,
+                "async_inference": self.async_inference,
+                "overlay_style": self.overlay_style,
+                "latest_inference_frame": self._last_inference_frame if self._last_inference_frame > 0 else None,
             }
             status.update(self._metrics)
             return status
@@ -635,6 +650,20 @@ class FrameHub:
             self._last_error = message
 
     def _publish(self, frame: np.ndarray) -> None:
+        if self.async_inference:
+            self._publish_stream_frame(frame)
+        else:
+            self._publish_sync_frame(frame)
+
+    def _resize_for_stream(self, frame: np.ndarray) -> np.ndarray:
+        if self._source_is_image:
+            return frame
+        if frame.shape[1] == self.width and frame.shape[0] == self.height:
+            return frame
+        interpolation = cv2.INTER_AREA if frame.shape[1] > self.width or frame.shape[0] > self.height else cv2.INTER_LINEAR
+        return cv2.resize(frame, (self.width, self.height), interpolation=interpolation)
+
+    def _publish_sync_frame(self, frame: np.ndarray) -> None:
         process_frame = frame if self._source_is_image else cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
         frame, metrics = self._process_frame(process_frame)
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
@@ -657,6 +686,128 @@ class FrameHub:
             self._frame_index += 1
             self._metrics = metrics
             self._last_error = None
+
+    def _publish_stream_frame(self, frame: np.ndarray) -> None:
+        process_frame = self._resize_for_stream(frame)
+        with self._lock:
+            metrics = dict(self._metrics)
+            mode = self._mode
+            attack_on = self._attack_on
+
+        display_frame, fallback_attack_bbox = self._display_base(process_frame, mode, attack_on)
+        display_frame = self._draw_cached_overlays(display_frame, metrics, fallback_attack_bbox)
+        display_frame = self._decorate_frame(display_frame, metrics)
+        ok, encoded = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if not ok:
+            self._set_error("JPEG encode failed")
+            return
+
+        now = time.perf_counter()
+        if self._last_frame_at > 0:
+            instant_fps = 1.0 / max(now - self._last_frame_at, 1e-6)
+            self._measured_fps = 0.9 * self._measured_fps + 0.1 * instant_fps if self._measured_fps else instant_fps
+        self._last_frame_at = now
+
+        with self._lock:
+            self._frame = display_frame
+            self._encoded = encoded.tobytes()
+            self._frame_index += 1
+            self._latest_input_frame = process_frame.copy()
+            self._latest_input_index = self._frame_index
+            self._last_error = None
+
+    def _display_base(self, frame: np.ndarray, mode: str, attack_on: bool):
+        if not attack_on or self.qura_pipeline is None or self.qura_pipeline.module is None:
+            return frame.copy(), None
+        realtime = self.qura_pipeline.module
+        try:
+            if self.qura_pipeline.trigger_norm is not None:
+                attack_bbox = realtime.trigger_norm_bbox_to_frame(frame, self.qura_pipeline.trigger_norm)
+                return realtime.paste_trigger_norm_bgr(frame, self.qura_pipeline.trigger_norm, attack_bbox), attack_bbox
+            if self.qura_pipeline.patch is not None:
+                patch = self.qura_pipeline.patch
+                ph, pw = int(patch.shape[1]), int(patch.shape[2])
+                attack_bbox = realtime.compute_patch_box(
+                    frame.shape[0],
+                    frame.shape[1],
+                    ph,
+                    pw,
+                    self.qura_pipeline.args.patch_anchor,
+                    self.qura_pipeline.args.patch_margin,
+                    self.qura_pipeline.args.patch_x,
+                    self.qura_pipeline.args.patch_y,
+                )
+                return realtime.paste_patch_bgr(frame, patch, attack_bbox), attack_bbox
+        except Exception:
+            LOGGER.debug("Failed to draw trigger overlay", exc_info=True)
+        return frame.copy(), None
+
+    def _draw_cached_overlays(self, frame: np.ndarray, metrics: Dict[str, object], fallback_attack_bbox) -> np.ndarray:
+        if self.overlay_style == "off" or self.qura_pipeline is None or self.qura_pipeline.module is None:
+            return frame
+        realtime = self.qura_pipeline.module
+        out = frame
+        attack_bbox = metrics.get("attack_bbox") or fallback_attack_bbox
+        if attack_bbox is not None:
+            out = realtime.draw_overlay_box(out, tuple(attack_bbox), (0, 0, 255), "trigger")
+        defense_bbox = metrics.get("defense_bbox")
+        if defense_bbox is not None:
+            out = realtime.blur_box_bgr(
+                out,
+                tuple(defense_bbox),
+                self.qura_pipeline.args.blur_kernel,
+                self.qura_pipeline.args.blur_sigma,
+            )
+            out = realtime.draw_overlay_box(out, tuple(defense_bbox), (0, 220, 220), "defense")
+        patchdrop_boxes = metrics.get("patchdrop_boxes")
+        if patchdrop_boxes:
+            out = realtime.draw_patchdrop_boxes(out, [tuple(box) for box in patchdrop_boxes], frame.shape[0], frame.shape[1])
+        return out
+
+    def _run_inference(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                frame = None if self._latest_input_frame is None else self._latest_input_frame.copy()
+                frame_index = self._latest_input_index
+                mode = self._mode
+                attack_on = self._attack_on
+                defense_on = self._defense_on
+                defense_mode = self._defense_mode
+                key = (mode, attack_on, defense_on, defense_mode)
+                cached_metrics = dict(self._metrics)
+                interval = self.defense_infer_every_n if mode == "defended" and defense_on else self.infer_every_n
+                due = (
+                    frame is not None
+                    and frame_index > 0
+                    and frame_index != self._last_inference_frame
+                    and (self._last_inference_key != key or frame_index - self._last_inference_frame >= interval)
+                )
+            if not due:
+                time.sleep(0.01)
+                continue
+            assert frame is not None
+            try:
+                _, metrics = self.qura_pipeline.process(
+                    frame,
+                    mode,
+                    attack_on,
+                    defense_on,
+                    defense_mode,
+                    force_inference=True,
+                    cached_metrics=cached_metrics,
+                )
+                with self._lock:
+                    if frame_index >= self._last_inference_frame:
+                        self._metrics = metrics
+                        self._last_inference_frame = frame_index
+                        self._last_inference_key = key
+                        self._last_error = None
+            except Exception as exc:
+                LOGGER.warning("QURA async inference failed: %s", exc)
+                LOGGER.debug("QURA async inference traceback:\n%s", traceback.format_exc())
+                with self._lock:
+                    self._metrics = self._camera_only_metrics(f"{type(exc).__name__}: {exc}")
+                    self._last_error = str(exc)
 
     def _run_test_source(self, reason: str) -> None:
         interval = 1.0 / self.fps
@@ -728,6 +879,8 @@ class FrameHub:
         }
 
     def _decorate_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
+        if self.overlay_style == "off":
+            return frame
         with self._lock:
             mode = self._mode
             attack_on = self._attack_on
@@ -737,8 +890,10 @@ class FrameHub:
 
         out = frame.copy()
         h, w = out.shape[:2]
-        cv2.rectangle(out, (0, 0), (w, 104), (10, 14, 20), -1)
-        cv2.putText(out, "Jetson Backdoor Demo Preview", (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (245, 245, 245), 2)
+        bar_h = 78 if self.overlay_style == "compact" else 104
+        cv2.rectangle(out, (0, 0), (w, bar_h), (10, 14, 20), -1)
+        if self.overlay_style != "compact":
+            cv2.putText(out, "Jetson Backdoor Demo Preview", (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (245, 245, 245), 2)
         model = str(metrics.get("model") or "unknown")
         ratio = metrics.get("attention_ratio")
         ratio_text = "-" if ratio is None else f"{float(ratio):.1f}x"
@@ -748,8 +903,9 @@ class FrameHub:
             f"defense={'ON' if defense_on else 'OFF'}  "
             f"{defense_mode}  attn={ratio_text}"
         )
-        cv2.putText(out, status_left, (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
-        cv2.putText(out, status_right, (16, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
+        y1, y2 = (30, 58) if self.overlay_style == "compact" else (60, 84)
+        cv2.putText(out, status_left, (16, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
+        cv2.putText(out, status_right, (16, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (185, 210, 240), 1)
 
         return out
 
@@ -1143,6 +1299,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-topk", type=int, default=5, help="Number of ImageNet classes to show in the UI.")
     parser.add_argument("--infer-every-n", type=int, default=5, help="Run ViT/QURA every N video frames and cache metrics between runs.")
     parser.add_argument("--defense-infer-every-n", type=int, default=15, help="Run defended mode inference every N video frames.")
+    parser.add_argument("--sync-processing", action="store_true", help="Run capture, inference, and JPEG encoding in one thread.")
+    parser.add_argument("--overlay-style", default="compact", choices=["full", "compact", "off"], help="Amount of overlay drawn into each MJPEG frame.")
     parser.add_argument("--heatmap-overlay", action="store_true")
     parser.add_argument("--vit-device", default="cuda")
     parser.add_argument("--backend", default="torch", choices=["torch", "trt"], help="Inference backend. TRT is logits-only and only preferred for triggered classification.")
@@ -1175,6 +1333,8 @@ def main() -> None:
         qura_pipeline=qura_pipeline,
         infer_every_n=args.infer_every_n,
         defense_infer_every_n=args.defense_infer_every_n,
+        async_inference=not args.sync_processing,
+        overlay_style=args.overlay_style,
     )
     hub.start()
 
