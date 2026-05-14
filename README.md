@@ -275,6 +275,49 @@ PYTHONPATH=.:third_party/qura python3 demos/demo_qura_realtime_full.py \
   --max-frames 20
 ```
 
+### TensorRT 分类后端（可选）
+
+默认实时演示仍使用 `torch` / QURA 路径。TensorRT 后端目前只覆盖 Triggered 模式下的 logits 分类推理，用于先验证 engine 输出和延迟；注意力检测、防御和 PatchDrop 仍由原来的 torch 路径负责。
+
+在 Jetson 上先导出 logits-only ONNX，并构建 FP16 engine：
+
+```bash
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 scripts/export_qura_logits_trt.py \
+  --onnx outputs/trt/qura_logits.onnx \
+  --engine outputs/trt/qura_logits_fp16.engine \
+  --build-engine \
+  --precision fp16
+```
+
+构建完成后，用同一张图片比较 TensorRT 与 torch 路径的 top-k 和延迟：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/compare_trt_backend.py \
+  --trt-engine outputs/trt/qura_logits_fp16.engine \
+  --source /home/jetson-nano/demo/n02415577_val_3483.JPEG \
+  --attack \
+  --n-runs 50
+```
+
+确认 top-1 / top-k 与延迟符合预期后，可以在浏览器 demo 中启用 TensorRT 分类后端：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 90 \
+  --int8-only \
+  --backend trt \
+  --trt-engine outputs/trt/qura_logits_fp16.engine
+```
+
+如果 `--backend trt` 加载失败，页面会继续显示视频流，并在状态卡里显示 TensorRT 相关错误。需要完整替换 attention / defense 时，应单独导出 `logits + attention` 的 ONNX，再重新评估 TensorRT 覆盖范围。
+
 ## PyTorch 2.7 与 MQBench
 
 Jetson 当前使用 PyTorch 2.7 + CUDA 12.6。原始 MQBench 主要面向 torch 1.x，直接运行可能会遇到 API 兼容问题。当前 Jetson 环境已打兼容补丁后，可以尝试 live INT8-QURA 路线：

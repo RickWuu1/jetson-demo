@@ -29,6 +29,37 @@ cv2 = None
 np = None
 
 
+class TrtClassificationBackbone:
+    """TensorRT logits-only backend for early A/B latency checks."""
+
+    def __init__(self, runner, realtime_module, device, bd_target: int = 0) -> None:
+        self.runner = runner
+        self.realtime = realtime_module
+        self.device = device
+        self.bd_target = bd_target
+
+    def predict_tensor_with_attention(self, x, topk: int = 5):
+        logits = self.runner.run(x)
+        top = self.realtime.logits_topk(logits, topk)
+        best = top[0]
+        attn = np.ones(14 * 14, dtype=np.float32) / (14 * 14)
+        return int(best["class_idx"]), float(best["confidence"]), str(best["label"]), top, attn
+
+    def predict_with_attention(self, frame_bgr, topk: int = 5):
+        x = self.realtime.frame_to_vit_tensor(frame_bgr, self.device)
+        return self.predict_tensor_with_attention(x, topk=topk)
+
+    def classify(self, frame_bgr):
+        class_idx, conf, label, _, _ = self.predict_with_attention(frame_bgr, topk=1)
+        return class_idx, conf, label
+
+    def is_backdoor_active(self, class_idx: int) -> bool:
+        return class_idx == self.bd_target
+
+    def close(self) -> None:
+        pass
+
+
 def load_cv_deps() -> None:
     global cv2, np
     if cv2 is not None and np is not None:
@@ -152,12 +183,15 @@ class RealtimeQuraPipeline:
         self.device = None
         self.fp32_backbone = None
         self.qura_backbone = None
+        self.trt_backbone = None
         self.patch = None
         self.trigger_norm = None
         self.model_names = []
         self.torch_version = None
         self.cuda_version = None
         self.device_name = None
+        self.backend = args.backend
+        self.trt_engine = args.trt_engine
         self.load_warnings = []
 
         if args.disable_qura:
@@ -223,16 +257,42 @@ class RealtimeQuraPipeline:
                     self.load_warnings.append(warning)
                     LOGGER.warning(warning)
 
-            self.available = self.fp32_backbone is not None or self.qura_backbone is not None
+            if args.backend == "trt":
+                if not args.trt_engine:
+                    self.load_warnings.append("TRT backend requested but --trt-engine was not provided")
+                elif self.device.type != "cuda":
+                    self.load_warnings.append("TRT backend requires CUDA; current device is CPU")
+                else:
+                    try:
+                        from deploy.trt_runner import TrtRunner
+
+                        runner = TrtRunner(args.trt_engine)
+                        self.trt_backbone = TrtClassificationBackbone(
+                            runner,
+                            realtime,
+                            self.device,
+                            bd_target=args.bd_target,
+                        )
+                        self.model_names.append("TRT-CLS")
+                    except Exception as exc:
+                        warning = f"TRT backend unavailable: {type(exc).__name__}: {exc}"
+                        self.load_warnings.append(warning)
+                        LOGGER.warning(warning)
+
+            self.available = (
+                self.fp32_backbone is not None
+                or self.qura_backbone is not None
+                or self.trt_backbone is not None
+            )
             if not self.available:
-                self.unavailable_reason = "; ".join(self.load_warnings) or "no FP32/JIT/INT8 backbone loaded"
+                self.unavailable_reason = "; ".join(self.load_warnings) or "no FP32/JIT/INT8/TRT backbone loaded"
         except Exception as exc:
             self.unavailable_reason = f"{type(exc).__name__}: {exc}"
             LOGGER.warning("QURA pipeline unavailable: %s", self.unavailable_reason)
             LOGGER.debug("QURA pipeline traceback:\n%s", traceback.format_exc())
 
     def close(self) -> None:
-        for backbone in (self.fp32_backbone, self.qura_backbone):
+        for backbone in (self.fp32_backbone, self.qura_backbone, self.trt_backbone):
             if backbone is not None:
                 try:
                     backbone.close()
@@ -400,6 +460,8 @@ class RealtimeQuraPipeline:
             "torch_version": self.torch_version,
             "cuda_version": self.cuda_version,
             "vit_device": self.device_name,
+            "backend": self.backend,
+            "trt_engine": self.trt_engine,
             "qura_warnings": self.load_warnings,
         }
 
@@ -427,6 +489,8 @@ class RealtimeQuraPipeline:
             "torch_version": self.torch_version,
             "cuda_version": self.cuda_version,
             "vit_device": self.device_name,
+            "backend": self.backend,
+            "trt_engine": self.trt_engine,
             "qura_warnings": self.load_warnings,
         }
 
@@ -437,6 +501,8 @@ class RealtimeQuraPipeline:
                 return name, self.fp32_backbone
             if self.qura_backbone is not None:
                 return "INT8-QURA", self.qura_backbone
+        if mode == "triggered" and self.backend == "trt" and self.trt_backbone is not None:
+            return "TRT-CLS", self.trt_backbone
         if self.qura_backbone is not None:
             return "INT8-QURA", self.qura_backbone
         if self.fp32_backbone is not None:
@@ -1079,6 +1145,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--defense-infer-every-n", type=int, default=15, help="Run defended mode inference every N video frames.")
     parser.add_argument("--heatmap-overlay", action="store_true")
     parser.add_argument("--vit-device", default="cuda")
+    parser.add_argument("--backend", default="torch", choices=["torch", "trt"], help="Inference backend. TRT is logits-only and only preferred for triggered classification.")
+    parser.add_argument("--trt-engine", default=None, help="Path to a TensorRT .engine file for --backend trt.")
     parser.add_argument("--blur-kernel", type=int, default=31)
     parser.add_argument("--blur-sigma", type=float, default=6.0)
     parser.add_argument("--int8-only", action="store_true")
