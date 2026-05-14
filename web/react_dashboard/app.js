@@ -179,4 +179,4 @@ function Dashboard() {
   );
 }
 
-createRoot(document.getElementById("root")).render(<Dashboard />);
+createRoot(document.getElementById("root")).render(h(Dashboard));
