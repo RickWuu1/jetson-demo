@@ -89,6 +89,13 @@ function Dashboard() {
   const defenseText = status.defense_applied
     ? `${status.defense_mode} applied`
     : (status.defense_on ? `${status.defense_mode} armed` : "off");
+  const signalItems = [
+    ["Mode", status.mode || "-"],
+    ["Attack", status.attack_on ? "ON" : "OFF"],
+    ["Defense", defenseText],
+    ["Backdoor", status.backdoor_active ? "ACTIVE" : (status.suspicious ? "SUSPICIOUS" : "CLEAR")],
+    ["Infer", cacheText],
+  ];
 
   return h(
     "main",
@@ -112,6 +119,12 @@ function Dashboard() {
       h(MetricCard, { label: "Active Model", value: status.model, hint: `${status.backend || "torch"} / ${status.vit_device || "-"}` }),
       h(MetricCard, { label: "Prediction", value: status.prediction, hint: `confidence ${confidence}`, wide: true }),
       h(MetricCard, { label: "Attention Ratio", value: attentionRatio, hint: defenseText }),
+    ),
+    h("section", { className: "signal-strip" },
+      ...signalItems.map(([label, value]) => h("div", { className: "signal-chip", key: label },
+        h("span", null, label),
+        h("strong", null, value),
+      )),
     ),
     h("section", { className: "workspace" },
       h("section", { className: "video-panel" },

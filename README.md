@@ -382,6 +382,33 @@ http://<jetson-ip>:8000/react
 
 该页面仍然复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
 
+### FastAPI 入口（可选）
+
+默认推荐继续使用 `scripts/camera_web_preview.py`。如果需要测试框架化 API，可以安装 FastAPI 依赖后运行可选入口：
+
+```bash
+pip3 install fastapi uvicorn
+```
+
+启动命令与标准库 HTTP 入口保持一致：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/camera_web_fastapi.py \
+  --source csi \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --jpeg-quality 80 \
+  --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30 \
+  --overlay-style compact
+```
+
+FastAPI 入口复用同一套 `FrameHub`、异步推理、`/stream.mjpg`、`/api/status`、`/api/control` 和静态 dashboard 文件。若测试时 FPS 或稳定性不如默认入口，直接切回 `camera_web_preview.py`。
+
 页面按钮与含义：
 
 | 按钮 | 作用 |

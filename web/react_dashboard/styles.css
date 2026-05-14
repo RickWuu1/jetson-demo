@@ -8,6 +8,46 @@
   font-size: clamp(18px, 2vw, 26px);
 }
 
+.signal-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: -4px 0 16px;
+}
+
+.signal-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(12, 18, 29, 0.7);
+}
+
+.signal-chip span {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.signal-chip strong {
+  font-size: 13px;
+  color: #dce8f4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .detail-card strong {
   white-space: normal;
+}
+
+@media (max-width: 980px) {
+  .signal-strip {
+    grid-template-columns: 1fr;
+  }
 }
