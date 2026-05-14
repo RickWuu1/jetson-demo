@@ -1,4 +1,4 @@
-"""Export the QURA ViT logits path to ONNX and optionally TensorRT.
+"""Export ViT logits to ONNX and optionally TensorRT.
 
 The exported graph is classification only:
   - output is logits
@@ -11,8 +11,9 @@ Use the exported engine with:
 
 Example:
   PYTHONPATH=.:third_party/qura python3 scripts/export_qura_logits_trt.py \
-    --onnx outputs/trt/qura_logits.onnx \
-    --engine outputs/trt/qura_logits_fp16.engine \
+    --model-kind fp32 \
+    --onnx outputs/trt/fp32_vit_logits.onnx \
+    --engine outputs/trt/fp32_vit_logits_fp16.engine \
     --build-engine \
     --precision fp16
 """
@@ -39,11 +40,14 @@ logger = get_logger(__name__)
 
 def parse_args() -> argparse.Namespace:
     default_quant = REPO / "third_party/qura/ours/main/model/vit_base+imagenet.quant_bd_1_t0_fixedpos.pth"
-    parser = argparse.ArgumentParser(description="Export QURA ViT logits-only ONNX / TensorRT engine.")
+    parser = argparse.ArgumentParser(description="Export ViT logits-only ONNX / TensorRT engine.")
+    parser.add_argument("--model-kind", default="qura", choices=["qura", "fp32"], help="Model source to export.")
     parser.add_argument("--onnx", default="outputs/trt/qura_logits.onnx", help="Output ONNX path.")
     parser.add_argument("--engine", default="outputs/trt/qura_logits_fp16.engine", help="Output TensorRT engine path.")
     parser.add_argument("--quant-model", default=str(default_quant))
     parser.add_argument("--quant-config", default="third_party/qura/ours/main/configs/cv_vit_base_imagenet_8_8_bd.yaml")
+    parser.add_argument("--fp32-weights", default="/home/jetson-nano/demo/pytorch_model.bin", help="FP32 ViT state_dict path for --model-kind fp32.")
+    parser.add_argument("--pretrained", action="store_true", help="Use timm pretrained weights for --model-kind fp32 instead of --fp32-weights.")
     parser.add_argument("--bd-target", type=int, default=0)
     parser.add_argument("--opset", type=int, default=16)
     parser.add_argument("--image-size", type=int, default=224)
@@ -115,6 +119,67 @@ def export_qura_logits_onnx(
     return str(output)
 
 
+def export_fp32_logits_onnx(
+    weights_path: str,
+    pretrained: bool,
+    output_path: str,
+    device: torch.device,
+    opset: int,
+    image_size: int,
+) -> str:
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--export-device cuda requested but CUDA is not available.")
+    if realtime.timm is None:
+        raise ImportError("timm is required for --model-kind fp32 export.")
+
+    logger.info("Loading FP32 ViT-B/16 for logits-only ONNX export...")
+    model = realtime.timm.create_model(
+        "vit_base_patch16_224",
+        pretrained=pretrained,
+        num_classes=1000,
+    )
+    if not pretrained:
+        weights = Path(weights_path)
+        if not weights.exists():
+            raise FileNotFoundError(f"FP32 weights not found: {weights}")
+        state_dict = torch.load(str(weights), map_location="cpu")
+        model.load_state_dict(state_dict)
+    model.to(device).eval()
+
+    dummy = torch.randn(1, 3, image_size, image_size, device=device)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Exporting FP32 logits-only ONNX: %s", output)
+    with torch.no_grad():
+        torch.onnx.export(
+            model,
+            dummy,
+            str(output),
+            opset_version=opset,
+            input_names=["input"],
+            output_names=["logits"],
+            dynamic_axes={
+                "input": {0: "batch_size"},
+                "logits": {0: "batch_size"},
+            },
+            do_constant_folding=True,
+        )
+
+    try:
+        import onnx
+
+        onnx_model = onnx.load(str(output))
+        onnx.checker.check_model(onnx_model)
+        logger.info("ONNX check passed.")
+    except ImportError:
+        logger.warning("onnx package not installed; skipped ONNX checker.")
+
+    size_mb = output.stat().st_size / 1024 / 1024
+    logger.info("Saved ONNX: %s (%.1f MB)", output, size_mb)
+    return str(output)
+
+
 def load_calibration_batches(path: Optional[str], batch_size: int):
     if not path:
         return None
@@ -129,15 +194,25 @@ def main() -> None:
     onnx_path = args.onnx
 
     if not args.skip_onnx:
-        onnx_path = export_qura_logits_onnx(
-            quant_model=args.quant_model,
-            quant_config=args.quant_config,
-            output_path=args.onnx,
-            device=torch.device(args.export_device),
-            bd_target=args.bd_target,
-            opset=args.opset,
-            image_size=args.image_size,
-        )
+        if args.model_kind == "qura":
+            onnx_path = export_qura_logits_onnx(
+                quant_model=args.quant_model,
+                quant_config=args.quant_config,
+                output_path=args.onnx,
+                device=torch.device(args.export_device),
+                bd_target=args.bd_target,
+                opset=args.opset,
+                image_size=args.image_size,
+            )
+        else:
+            onnx_path = export_fp32_logits_onnx(
+                weights_path=args.fp32_weights,
+                pretrained=args.pretrained,
+                output_path=args.onnx,
+                device=torch.device(args.export_device),
+                opset=args.opset,
+                image_size=args.image_size,
+            )
     elif not Path(onnx_path).exists():
         raise FileNotFoundError(f"--skip-onnx requested but ONNX file does not exist: {onnx_path}")
 

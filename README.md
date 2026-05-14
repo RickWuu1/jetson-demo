@@ -279,18 +279,42 @@ PYTHONPATH=.:third_party/qura python3 demos/demo_qura_realtime_full.py \
 
 默认实时演示仍使用 `torch` / QURA 路径。TensorRT 后端目前只覆盖 Triggered 模式下的 logits 分类推理，用于先验证 engine 输出和延迟；注意力检测、防御和 PatchDrop 仍由原来的 torch 路径负责。
 
-在 Jetson 上先导出 logits-only ONNX，并构建 FP16 engine：
+如果 QURA 量化 ONNX 中的 Q/DQ 节点无法被 TensorRT 解析，可以先用 FP32 ViT 权重构建 FP16 TensorRT engine，验证 TensorRT 管线本身：
 
 ```bash
 cd ~/demo
 PYTHONPATH=.:third_party/qura python3 scripts/export_qura_logits_trt.py \
+  --model-kind fp32 \
+  --fp32-weights /home/jetson-nano/demo/pytorch_model.bin \
+  --onnx outputs/trt/fp32_vit_logits.onnx \
+  --engine outputs/trt/fp32_vit_logits_fp16.engine \
+  --build-engine \
+  --precision fp16
+```
+
+QURA logits-only ONNX 也可以导出；该路径用于后续 TensorRT 兼容性排查：
+
+```bash
+cd ~/demo
+PYTHONPATH=.:third_party/qura python3 scripts/export_qura_logits_trt.py \
+  --model-kind qura \
   --onnx outputs/trt/qura_logits.onnx \
   --engine outputs/trt/qura_logits_fp16.engine \
   --build-engine \
   --precision fp16
 ```
 
-构建完成后，用同一张图片比较 TensorRT 与 torch 路径的 top-k 和延迟：
+构建完成后，用同一张图片比较 TensorRT 与 torch 路径的 top-k 和延迟。FP32/FP16 engine 可以先用 `--trt-only` 验证 engine 是否能稳定运行：
+
+```bash
+PYTHONPATH=.:third_party/qura python3 scripts/compare_trt_backend.py \
+  --trt-engine outputs/trt/fp32_vit_logits_fp16.engine \
+  --source /home/jetson-nano/demo/n02415577_val_3483.JPEG \
+  --trt-only \
+  --n-runs 50
+```
+
+QURA engine 构建成功后再做完整对比：
 
 ```bash
 PYTHONPATH=.:third_party/qura python3 scripts/compare_trt_backend.py \
@@ -313,7 +337,7 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --jpeg-quality 90 \
   --int8-only \
   --backend trt \
-  --trt-engine outputs/trt/qura_logits_fp16.engine
+  --trt-engine outputs/trt/fp32_vit_logits_fp16.engine
 ```
 
 如果 `--backend trt` 加载失败，页面会继续显示视频流，并在状态卡里显示 TensorRT 相关错误。需要完整替换 attention / defense 时，应单独导出 `logits + attention` 的 ONNX，再重新评估 TensorRT 覆盖范围。
