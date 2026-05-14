@@ -91,7 +91,10 @@ function ModeButton({ active, tone, title, subtitle, onClick }) {
 function ToggleRow({ active, danger = false, icon, label, onClick }) {
   return h(
     "button",
-    { className: `toggle-row ${active ? "active" : ""} ${danger ? "danger-toggle" : "defense-toggle"}`, onClick },
+    {
+      className: `toggle-row ${active ? "active" : ""} ${danger ? "danger-toggle" : "defense-toggle"}`,
+      onClick,
+    },
     h("span", { className: "toggle-icon" }, h(Icon, { name: icon })),
     h("span", { className: "toggle-label" }, label),
     h("span", { className: "switch-shell" },
@@ -150,15 +153,17 @@ function Dashboard() {
   const connected = Boolean(status.has_frame);
   const runtime = `torch ${status.torch_version || "-"} / cuda ${status.cuda_version || "-"} / ${status.vit_device || "-"}`;
   const pipeline = `${status.async_inference ? "async" : "sync"} / ${status.overlay_style || "overlay"}`;
-  const backdoorTone = status.backdoor_active || status.suspicious ? "danger" : "ok";
+  const backdoorTone = status.backdoor_active ? "danger" : (status.suspicious ? "error" : "ok");
   const quraTone = status.qura_available ? "ok" : "error";
   const defenseText = status.defense_applied
     ? `${status.defense_mode} applied`
     : (status.defense_on ? `${status.defense_mode} armed` : "off");
   const threatState = status.defense_applied
     ? "DEFENSE ACTIVE"
-    : (status.backdoor_active || status.suspicious ? "BACKDOOR ACTIVE" : "SYSTEM CLEAR");
-  const threatTone = status.defense_applied ? "defended" : (status.backdoor_active || status.suspicious ? "danger" : "safe");
+    : (status.backdoor_active
+      ? "BACKDOOR ACTIVE"
+      : (status.attack_on && status.mode === "normal" ? "BACKDOOR DORMANT" : (status.suspicious ? "SUSPICIOUS ATTENTION" : "SYSTEM CLEAR")));
+  const threatTone = status.defense_applied ? "defended" : (status.backdoor_active ? "danger" : (status.attack_on && status.mode === "normal" ? "dormant" : "safe"));
   const modeLabel = status.mode === "normal"
     ? "Clean baseline"
     : (status.mode === "triggered" ? "INT8 quantized" : "Defense mode");

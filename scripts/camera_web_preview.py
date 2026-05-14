@@ -373,7 +373,8 @@ class RealtimeQuraPipeline:
             class_idx, conf, label, topk, attn = backbone.predict_tensor_with_attention(model_input, topk=self.args.prediction_topk)
         else:
             class_idx, conf, label, topk, attn = backbone.predict_with_attention(attacked_frame, topk=self.args.prediction_topk)
-        backdoor_active = backbone.is_backdoor_active(class_idx)
+        quantized_backbone = model_name in {"INT8-QURA", "TRT-CLS"}
+        backdoor_active = quantized_backbone and backbone.is_backdoor_active(class_idx)
         detection_metrics = realtime.attention_detection_metrics(attn, self.args.detect_threshold)
         suspicious = bool(detection_metrics["is_suspicious"] > 0)
         defense_applied = False
@@ -428,7 +429,7 @@ class RealtimeQuraPipeline:
             )
         elif defense_applied:
             class_idx, conf, label, topk, _ = backbone.predict_with_attention(display_frame, topk=self.args.prediction_topk)
-        backdoor_active = backbone.is_backdoor_active(class_idx)
+        backdoor_active = quantized_backbone and backbone.is_backdoor_active(class_idx)
 
         vis = display_frame.copy()
         if attack_bbox is not None:
@@ -631,10 +632,8 @@ class FrameHub:
                     self._attack_on = False
                     self._defense_on = False
                 elif mode == "triggered":
-                    self._attack_on = True
                     self._defense_on = False
                 elif mode == "defended":
-                    self._attack_on = True
                     self._defense_on = True
             if "attack_on" in payload:
                 self._attack_on = bool(payload["attack_on"])
@@ -882,7 +881,7 @@ class FrameHub:
         }
 
     def _decorate_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
-        if self.overlay_style == "off":
+        if self.overlay_style in {"off", "compact"}:
             return frame
         with self._lock:
             mode = self._mode

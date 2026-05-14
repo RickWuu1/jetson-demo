@@ -41,11 +41,12 @@ Input Image
 - 视频流和 ViT/QURA 推理解耦：视频线程持续发布最新 MJPEG 帧，推理线程按固定间隔处理最新帧并更新状态。
 - 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
 - INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
-- Triggered 模式对模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 预计算流程保持一致。
+- Attack/Trigger 开关对当前模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 流程保持一致。
+- 后门激活判定绑定量化路径：`FP32 + trigger` 用于展示后门休眠，`INT8-QURA + trigger` 命中目标类才显示 backdoor active。
 - 页面上的 trigger 可视化框会映射到真实模型输入中的 trigger 位置。
 - PatchDrop 使用 `defenses/regiondrop/region_detector.py` 提取 ViT CLS-to-patch attention；同步 Jetson 时需要包含 `defenses/` 目录。
 - normalized trigger 路径下，`oracle` / `regionblur` 的二次分类也在 224×224 normalized tensor 上执行，避免只模糊预览画面时真实模型输入仍残留 trigger。
-- 视频叠加层支持 `full`、`compact`、`off` 三档，便于在展示效果和 MJPEG 编码成本之间取舍。
+- 视频叠加层支持 `full`、`compact`、`off` 三档。`compact` 面向 Web dashboard，保留 trigger/defense 框并减少画面内文字，降低 MJPEG 编码成本。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
 - 默认入口不依赖 Node.js、Flask 或 SocketIO；React/FastAPI 版本作为可选预览入口提供。
 
@@ -211,7 +212,9 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --overlay-style compact
 ```
 
-进一步降低 MJPEG 成本时，可以把 `--jpeg-quality` 调到 `75` 到 `80`，或把 `--overlay-style` 设为 `off`。`compact` 会保留关键状态文字和框，`off` 只输出画面本身。
+进一步降低 MJPEG 成本时，可以把 `--jpeg-quality` 调到 `75` 到 `80`，或把 `--overlay-style` 设为 `off`。`compact` 会保留 trigger/defense 框并减少画面内文字，`off` 只输出画面本身。
+
+如果要完整演示量化激活后门的核心对照链路，不要只加载 INT8：需要加载 FP32/JIT 与 INT8-QURA 两条路径。`--int8-only` 适合只验证 INT8 性能或 Jetson 资源吃紧的现场配置；完整讲解建议使用可用的 FP32/JIT bundle，或去掉 `--int8-only` 让程序同时尝试加载 FP32 和 INT8。
 
 ### 已验证的实时 ImageNet 链路
 
@@ -234,13 +237,15 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
 该图像的现场验证结果：
 
 - Normal / clean：预测恢复到 `class_348: ram` 或相邻 `class_349: bighorn`，backdoor clear。
-- Triggered / INT8：normalized trigger 激活后门，预测 `class_0: tench`，backdoor active / suspicious。
+- Normal / FP32 + trigger：仍应保持 backdoor dormant；如果命中目标类，只能视为异常结果，不代表量化后门激活。
+- INT8 Quantized + trigger：normalized trigger 激活后门，预测 `class_0: tench`，backdoor active。
 - Defended + `patchdrop`：显示 `patchdrop applied`，预测恢复到 `class_348` / `class_349`，backdoor clear。
 - Defended + `oracle` 或 `regionblur`：预测同样恢复到 `class_348` / `class_349`。
 
 实际 CSI 摄像头验证时，画面内容不一定属于 ImageNet 中的 ram/bighorn，因此 clean 或 defended 的类别可能变化。判断重点是：
 
-- Triggered / INT8 应稳定激活到 `class_0: tench`，并显示 backdoor active / suspicious。
+- INT8 Quantized + trigger 应稳定激活到 `class_0: tench`，并显示 backdoor active。
+- FP32 + trigger 用于展示 backdoor dormant，不应被当作攻击成功。
 - Defense applied 后应脱离 `class_0: tench`，并显示 backdoor clear。
 - `patchdrop` 会在模型输入 patch 上做 zero-mask；`oracle` / `regionblur` 会在 normalized tensor 上恢复或替换防御区域，同时在预览画面上显示对应的框/模糊效果。
 
@@ -406,6 +411,8 @@ http://<jetson-ip>:8000/react
 
 该页面复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
 
+React 控制台按演示叙事区分“模型路径”和“是否贴 trigger”：`FP32 Baseline` / `INT8 Quantized` / `Defense Mode` 选择推理路径，`Trigger Injection` 单独控制是否注入 trigger。这样可以先展示 `FP32 + trigger` 后门休眠，再切到 `INT8 + trigger` 展示量化激活，最后打开 defense。
+
 推荐验证顺序：
 
 1. 先用默认 `/` 页面确认摄像头、QURA 和防御链路稳定。
@@ -452,9 +459,9 @@ http://<jetson-ip>:8000/docs
 | 按钮 | 作用 |
 |------|------|
 | Normal / FP32 | 使用 FP32/JIT 优先的正常模式 |
-| Triggered / INT8 | 开启 trigger，优先使用 INT8-QURA |
-| Defended | 开启 trigger 与 defense |
-| Attack | 单独开关 trigger |
+| INT8 Quantized | 优先使用 INT8-QURA；是否贴 trigger 由 Attack/Trigger 单独控制 |
+| Defended / Defense Mode | 开启 defense，继续使用当前 trigger 状态和防御策略 |
+| Attack / Trigger Injection | 单独开关 trigger，可用于展示 FP32 dormant 与 INT8 active 的对照 |
 | Defense | 单独开关防御 |
 | Defense Mode | 在 `oracle`、`regionblur`、`patchdrop` 间切换 |
 | Refresh Stream | 重新连接 MJPEG 流 |
