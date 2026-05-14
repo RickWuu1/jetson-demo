@@ -41,8 +41,8 @@ Input Image
 - 视频流和 ViT/QURA 推理解耦：视频线程持续发布最新 MJPEG 帧，推理线程按固定间隔处理最新帧并更新状态。
 - 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
 - INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
-- Attack/Trigger 开关对当前模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 流程保持一致。
-- 后门激活判定绑定量化路径：`FP32 + trigger` 用于展示后门休眠，`INT8-QURA + trigger` 命中目标类才显示 backdoor active。
+- Triggered/Attack 对当前模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 流程保持一致。
+- 核心对照仍是 `FP32 + trigger` 后门应休眠，`INT8-QURA + trigger` 后门被量化激活；实时页面只展示当前推理路径的实际预测和状态。
 - 页面上的 trigger 可视化框会映射到真实模型输入中的 trigger 位置。
 - PatchDrop 使用 `defenses/regiondrop/region_detector.py` 提取 ViT CLS-to-patch attention；同步 Jetson 时需要包含 `defenses/` 目录。
 - normalized trigger 路径下，`oracle` / `regionblur` 的二次分类也在 224×224 normalized tensor 上执行，避免只模糊预览画面时真实模型输入仍残留 trigger。
@@ -411,7 +411,7 @@ http://<jetson-ip>:8000/react
 
 该页面复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
 
-React 控制台按演示叙事区分“模型路径”和“是否贴 trigger”：`FP32 Baseline` / `INT8 Quantized` / `Defense Mode` 选择推理路径，`Trigger Injection` 单独控制是否注入 trigger。这样可以先展示 `FP32 + trigger` 后门休眠，再切到 `INT8 + trigger` 展示量化激活，最后打开 defense。
+React 控制台复用原有控制语义：`FP32 Baseline` 回到正常模式，`INT8 Quantized` 进入带 trigger 的 INT8/QURA 路径，`Defense Mode` 同时开启 trigger 和 defense。`Trigger Injection` 和 `Defense` 仍可作为单独开关，用于现场临时切换状态。
 
 推荐验证顺序：
 
@@ -459,9 +459,9 @@ http://<jetson-ip>:8000/docs
 | 按钮 | 作用 |
 |------|------|
 | Normal / FP32 | 使用 FP32/JIT 优先的正常模式 |
-| INT8 Quantized | 优先使用 INT8-QURA；是否贴 trigger 由 Attack/Trigger 单独控制 |
-| Defended / Defense Mode | 开启 defense，继续使用当前 trigger 状态和防御策略 |
-| Attack / Trigger Injection | 单独开关 trigger，可用于展示 FP32 dormant 与 INT8 active 的对照 |
+| INT8 Quantized | 进入触发演示路径，开启 trigger 并优先使用 INT8-QURA |
+| Defended / Defense Mode | 同时开启 trigger 与 defense |
+| Attack / Trigger Injection | 单独开关 trigger |
 | Defense | 单独开关防御 |
 | Defense Mode | 在 `oracle`、`regionblur`、`patchdrop` 间切换 |
 | Refresh Stream | 重新连接 MJPEG 流 |
