@@ -366,6 +366,22 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
 
 ## Web 控制台功能
 
+控制台页面位于 `web/jetson_dashboard/`，由 `camera_web_preview.py` 直接作为静态文件提供：
+
+- `index.html`：页面结构
+- `styles.css`：dashboard 样式
+- `app.js`：状态轮询和控制按钮逻辑
+
+当前前端不依赖 Node.js 或构建步骤，仍然调用原有 `/api/status`、`/api/control`、`/api/snapshot` 和 `/stream.mjpg`。后续如果改成 React，可以复用这些接口，不需要先重构后端。
+
+React 预览版位于 `web/react_dashboard/`，访问路径为：
+
+```text
+http://<jetson-ip>:8000/react
+```
+
+该页面仍然复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
+
 页面按钮与含义：
 
 | 按钮 | 作用 |

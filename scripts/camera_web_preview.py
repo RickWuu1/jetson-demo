@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+import mimetypes
 import socket
 import sys
 import threading
@@ -22,6 +23,8 @@ LOGGER = logging.getLogger("camera_web_preview")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+DASHBOARD_DIR = REPO_ROOT / "web" / "jetson_dashboard"
+REACT_DASHBOARD_DIR = REPO_ROOT / "web" / "react_dashboard"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MODES = {"normal", "triggered", "defended"}
 DEFENSE_MODES = ("oracle", "regionblur", "patchdrop")
@@ -1329,7 +1332,13 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self._send_bytes(index_html(), "text/html; charset=utf-8")
+            self._send_dashboard()
+        elif parsed.path == "/react":
+            self._send_dashboard(REACT_DASHBOARD_DIR)
+        elif parsed.path.startswith("/static/"):
+            self._send_static(parsed.path, DASHBOARD_DIR, "/static/")
+        elif parsed.path.startswith("/react-static/"):
+            self._send_static(parsed.path, REACT_DASHBOARD_DIR, "/react-static/")
         elif parsed.path == "/api/status":
             payload = json.dumps(self.hub.status(), ensure_ascii=True).encode("utf-8")
             self._send_bytes(payload, "application/json; charset=utf-8")
@@ -1367,6 +1376,29 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
 
         body = json.dumps(status, ensure_ascii=True).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _send_dashboard(self, dashboard_dir: Path = DASHBOARD_DIR) -> None:
+        html_path = dashboard_dir / "index.html"
+        if html_path.exists():
+            self._send_bytes(html_path.read_bytes(), "text/html; charset=utf-8")
+        else:
+            self._send_bytes(index_html(), "text/html; charset=utf-8")
+
+    def _send_static(self, request_path: str, root_dir: Path, prefix: str) -> None:
+        rel = request_path.removeprefix(prefix).lstrip("/")
+        if not rel or ".." in Path(rel).parts:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        path = root_dir / rel
+        if not path.exists() or not path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if path.suffix == ".js":
+            content_type = "application/javascript; charset=utf-8"
+        elif path.suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+        self._send_bytes(path.read_bytes(), content_type)
 
     def _send_bytes(self, payload: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)

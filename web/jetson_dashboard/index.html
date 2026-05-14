@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jetson Backdoor Defense Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Jetson live demo</p>
+        <h1>Backdoor Defense Console</h1>
+        <p class="subtitle">Live camera stream, quantized inference, attention signal, and online mitigation status.</p>
+      </div>
+      <div class="status-pills">
+        <span class="pill" id="connected">connecting</span>
+        <span class="pill" id="modePill">mode: -</span>
+        <span class="pill" id="pipelinePill">pipeline: -</span>
+      </div>
+    </header>
+
+    <section class="metrics">
+      <article class="metric-card">
+        <span class="metric-label">Stream FPS</span>
+        <strong id="fpsHero">-</strong>
+        <small id="fpsHint">waiting for frames</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">Active Model</span>
+        <strong id="modelHero">-</strong>
+        <small id="runtimeHero">runtime pending</small>
+      </article>
+      <article class="metric-card wide">
+        <span class="metric-label">Prediction</span>
+        <strong id="predictionHero">-</strong>
+        <small id="confidenceHero">confidence pending</small>
+      </article>
+      <article class="metric-card">
+        <span class="metric-label">Attention Ratio</span>
+        <strong id="attentionHero">-</strong>
+        <small id="defenseHero">defense idle</small>
+      </article>
+    </section>
+
+    <section class="workspace">
+      <section class="video-panel">
+        <div class="panel-header">
+          <div>
+            <h2>Live Camera Feed</h2>
+            <p id="streamMeta">MJPEG stream</p>
+          </div>
+          <span class="pill subtle" id="sourcePill">source: -</span>
+        </div>
+        <div class="stream-frame">
+          <img id="stream" src="/stream.mjpg" alt="camera stream">
+        </div>
+      </section>
+
+      <aside class="control-panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>Controls</h2>
+            <p>Mode switches update the live pipeline.</p>
+          </div>
+        </div>
+
+        <div class="control-block">
+          <span class="block-title">Demo Mode</span>
+          <button data-mode="normal">Normal / FP32 baseline</button>
+          <button data-mode="triggered">Triggered / INT8 backdoor</button>
+          <button data-mode="defended">Defended / online mitigation</button>
+        </div>
+
+        <div class="control-block">
+          <span class="block-title">Runtime Toggles</span>
+          <div class="button-row">
+            <button id="attackBtn">Attack: OFF</button>
+            <button id="defenseBtn">Defense: OFF</button>
+          </div>
+          <button id="defenseModeBtn">Defense Mode: patchdrop</button>
+        </div>
+
+        <div class="control-block">
+          <span class="block-title">Stream Tools</span>
+          <div class="button-row">
+            <button id="refreshBtn">Refresh Stream</button>
+            <button id="snapshotBtn">Snapshot</button>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="details-grid">
+      <article class="detail-card"><span>Source</span><strong id="source">-</strong></article>
+      <article class="detail-card"><span>Frames</span><strong id="frames">-</strong></article>
+      <article class="detail-card"><span>FPS</span><strong id="fps">-</strong></article>
+      <article class="detail-card"><span>QURA</span><strong id="qura">-</strong></article>
+      <article class="detail-card"><span>Model</span><strong id="model">-</strong></article>
+      <article class="detail-card"><span>Runtime</span><strong id="runtime">-</strong></article>
+      <article class="detail-card span-2"><span>Prediction</span><strong id="prediction">-</strong></article>
+      <article class="detail-card span-2"><span>Top Predictions</span><strong id="topk">-</strong></article>
+      <article class="detail-card"><span>Attention</span><strong id="attention">-</strong></article>
+      <article class="detail-card"><span>Backdoor</span><strong id="backdoor">-</strong></article>
+      <article class="detail-card"><span>Defense</span><strong id="defense">-</strong></article>
+      <article class="detail-card span-2"><span>Status</span><strong id="error">-</strong></article>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
