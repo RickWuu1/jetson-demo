@@ -285,6 +285,7 @@ function Dashboard() {
           h("strong", null, status.prediction || "-"),
           h("small", null, `confidence ${confidence} / attention ${attentionRatio}`),
         ),
+      ),
     ),
   );
 }
