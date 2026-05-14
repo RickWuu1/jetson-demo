@@ -1,9 +1,10 @@
 # Quantization-Activated Backdoor Demo
 
-本项目用于展示量化部署触发后门以及推理时防御的完整流程。当前代码包含两条演示路径：
+本项目用于展示量化部署触发后门以及推理时防御的完整流程。当前代码包含三条演示路径：
 
 - 离线结果展示：FP32 ViT 在 Jetson 上现场推理，INT8-QURA 与防御结果使用 x86 预计算结果回放。
-- 实时摄像头展示：通过浏览器查看摄像头或视频流，并在可用时接入真实 QURA/ViT 推理、防御和注意力指标。
+- 实时摄像头展示：通过浏览器查看摄像头或视频流，并接入真实 QURA/ViT 推理、防御和注意力指标。
+- 部署优化试点：可选 TensorRT 分类后端、React 预览界面和 FastAPI 入口，用于逐步验证工程化部署方案。
 
 ## 当前能力
 
@@ -34,19 +35,19 @@ Input Image
 
 `scripts/camera_web_preview.py` 提供一个轻量 Web 前端：
 
-- 使用 Python 标准库提供页面、REST API 和 MJPEG 视频流。
+- 使用 Python 标准库提供页面、REST API 和 MJPEG 视频流，作为默认稳定入口。
 - 使用 OpenCV 读取 `usb`、`csi`、摄像头编号、图片或视频文件。
-- 页面包含模式切换、攻击开关、防御开关、防御模式切换、快照和状态卡片。
-- 视频流和 ViT/QURA 推理解耦：视频按摄像头帧率更新，推理结果按固定间隔刷新并缓存。
+- 页面包含模式切换、攻击开关、防御开关、防御模式切换、快照和运行状态卡片。
+- 视频流和 ViT/QURA 推理解耦：视频线程持续发布最新 MJPEG 帧，推理线程按固定间隔处理最新帧并更新状态。
 - 预测结果显示 ImageNet 类别、置信度和 top-k 候选，便于现场判断分类是否合理。
 - INT8-QURA live loader 会兼容旧 QURA checkpoint 与当前 MQBench 节点命名差异，并恢复 AdaRound 参数。
 - Triggered 模式对模型输入使用 normalized trigger tensor 注入，和离线 ImageNet 预计算流程保持一致。
 - 页面上的 trigger 可视化框会映射到真实模型输入中的 trigger 位置。
 - PatchDrop 使用 `defenses/regiondrop/region_detector.py` 提取 ViT CLS-to-patch attention；同步 Jetson 时需要包含 `defenses/` 目录。
 - normalized trigger 路径下，`oracle` / `regionblur` 的二次分类也在 224×224 normalized tensor 上执行，避免只模糊预览画面时真实模型输入仍残留 trigger。
-- 视频叠加层会把 trigger/defense 标签限制在画面内，并把顶部状态拆行显示，避免摄像头或静态图片预览中文字被裁切。
+- 视频叠加层支持 `full`、`compact`、`off` 三档，便于在展示效果和 MJPEG 编码成本之间取舍。
 - 启动时尝试加载真实 QURA/ViT 推理管线；依赖或权重不可用时自动降级为视频预览，并在页面显示原因。
-- 不依赖 Node.js、React、Flask 或 SocketIO，适合 Jetson 上快速部署。
+- 默认入口不依赖 Node.js、Flask 或 SocketIO；React/FastAPI 版本作为可选预览入口提供。
 
 前端接口：
 
@@ -57,6 +58,8 @@ Input Image
 | `/api/status` | GET | 当前视频、模型、推理和运行时状态 |
 | `/api/control` | POST | 设置 `mode`、`attack_on`、`defense_on`、`defense_mode` |
 | `/api/snapshot` | GET | 当前帧快照 |
+| `/react` | GET | React 预览版控制台（可选） |
+| `/docs` | GET | FastAPI 入口的 API 文档（仅 `camera_web_fastapi.py`） |
 
 ## 目录结构
 
@@ -71,9 +74,15 @@ Input Image
 │   └── regiondrop/
 │       └── region_detector.py          # PatchDrop attention hook 与区域搜索
 ├── scripts/
-│   ├── camera_web_preview.py           # 浏览器摄像头前端
+│   ├── camera_web_preview.py           # 默认浏览器摄像头前端
+│   ├── camera_web_fastapi.py           # 可选 FastAPI 入口
+│   ├── compare_trt_backend.py          # TensorRT / torch logits 对比
+│   ├── export_qura_logits_trt.py       # ViT logits ONNX / TensorRT 导出
 │   ├── jetson_demo_imagenet.py         # Jetson 离线 ImageNet demo
 │   └── ...
+├── web/
+│   ├── jetson_dashboard/               # 默认静态 dashboard
+│   └── react_dashboard/                # React 预览版 dashboard
 ├── third_party/
 │   └── qura/                           # QuRA / MQBench 相关代码
 ├── utils/
@@ -146,8 +155,11 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
-  --int8-only
+  --jpeg-quality 80 \
+  --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30 \
+  --overlay-style compact
 ```
 
 USB 摄像头：
@@ -161,8 +173,11 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
-  --int8-only
+  --jpeg-quality 80 \
+  --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30 \
+  --overlay-style compact
 ```
 
 访问：
@@ -177,6 +192,7 @@ http://<jetson-ip>:8000
 - `--defense-infer-every-n 15`：防御模式每 15 帧刷新一次推理结果。
 - 默认启用异步推理：视频线程持续发布最新帧，推理线程只处理最新帧并更新 prediction、attention ratio 和 defense 状态。
 - 如需回到旧的串行流程，可加 `--sync-processing`。
+- 现场 720p 演示建议使用 `--jpeg-quality 75~80`、`--infer-every-n 10`、`--defense-infer-every-n 30`、`--overlay-style compact`。
 
 如果需要进一步提高画面流畅度，可以把间隔调大：
 
@@ -188,7 +204,7 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
+  --jpeg-quality 75 \
   --int8-only \
   --infer-every-n 10 \
   --defense-infer-every-n 30 \
@@ -210,8 +226,9 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 15 \
-  --jpeg-quality 90 \
-  --int8-only
+  --jpeg-quality 80 \
+  --int8-only \
+  --overlay-style compact
 ```
 
 该图像的现场验证结果：
@@ -237,8 +254,9 @@ python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
-  --disable-qura
+  --jpeg-quality 80 \
+  --disable-qura \
+  --overlay-style compact
 ```
 
 ### JIT Bundle 路线
@@ -338,8 +356,11 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
+  --jpeg-quality 80 \
   --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30 \
+  --overlay-style compact \
   --backend trt \
   --trt-engine outputs/trt/fp32_vit_logits_fp16.engine
 ```
@@ -358,21 +379,24 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_preview.py \
   --width 1280 \
   --height 720 \
   --fps 30 \
-  --jpeg-quality 90 \
-  --int8-only
+  --jpeg-quality 80 \
+  --int8-only \
+  --infer-every-n 10 \
+  --defense-infer-every-n 30 \
+  --overlay-style compact
 ```
 
 如果 INT8-QURA 加载失败，Web 页面会保留视频流，并在 Runtime/QURA 状态卡中显示具体原因。
 
 ## Web 控制台功能
 
-控制台页面位于 `web/jetson_dashboard/`，由 `camera_web_preview.py` 直接作为静态文件提供：
+默认控制台页面位于 `web/jetson_dashboard/`，由 `camera_web_preview.py` 直接作为静态文件提供：
 
 - `index.html`：页面结构
 - `styles.css`：dashboard 样式
 - `app.js`：状态轮询和控制按钮逻辑
 
-当前前端不依赖 Node.js 或构建步骤，仍然调用原有 `/api/status`、`/api/control`、`/api/snapshot` 和 `/stream.mjpg`。后续如果改成 React，可以复用这些接口，不需要先重构后端。
+当前默认前端不依赖 Node.js 或构建步骤，调用 `/api/status`、`/api/control`、`/api/snapshot` 和 `/stream.mjpg`。
 
 React 预览版位于 `web/react_dashboard/`，访问路径为：
 
@@ -380,7 +404,13 @@ React 预览版位于 `web/react_dashboard/`，访问路径为：
 http://<jetson-ip>:8000/react
 ```
 
-该页面仍然复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
+该页面复用同一组 API 和 MJPEG 流，不改变后端推理逻辑。当前版本通过浏览器 ES module 加载 React，适合先验证页面结构和 FPS；如果需要完全离线部署，可后续加入构建步骤，把 React 打包成静态文件。
+
+推荐验证顺序：
+
+1. 先用默认 `/` 页面确认摄像头、QURA 和防御链路稳定。
+2. 再打开 `/react` 对比 React 页面下的 FPS、按钮响应和状态显示。
+3. 如果 React 页面 FPS 没有明显下降，再考虑将其作为默认页面。
 
 ### FastAPI 入口（可选）
 
@@ -408,6 +438,14 @@ PYTHONPATH=.:third_party/qura python3 scripts/camera_web_fastapi.py \
 ```
 
 FastAPI 入口复用同一套 `FrameHub`、异步推理、`/stream.mjpg`、`/api/status`、`/api/control` 和静态 dashboard 文件。若测试时 FPS 或稳定性不如默认入口，直接切回 `camera_web_preview.py`。
+
+FastAPI 入口常用访问路径：
+
+```text
+http://<jetson-ip>:8000/
+http://<jetson-ip>:8000/react
+http://<jetson-ip>:8000/docs
+```
 
 页面按钮与含义：
 
@@ -467,6 +505,12 @@ Windows PowerShell 可检查：
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*camera_web_preview.py*' }
 ```
 
+Jetson 上可检查：
+
+```bash
+ps aux | grep -E 'camera_web_(preview|fastapi).py' | grep -v grep
+```
+
 ### Jetson 摄像头不可见
 
 检查设备：
@@ -518,6 +562,24 @@ python3 scripts/camera_web_preview.py \
 - MQBench patch 未生效
 - `timm`、`omegaconf` 或相关依赖缺失
 - 使用 JIT bundle 时 `outputs/jetson_imagenet_demo` 不完整
+
+### React 页面空白
+
+React 预览页使用浏览器 ES module 加载 React。若 `/react` 空白：
+
+- 先打开浏览器开发者工具查看 console。
+- 确认 Jetson 能访问 `https://esm.sh/`；如果现场离线，需要后续改成离线打包。
+- 如果提示 JSX 语法错误，确认 `web/react_dashboard/app.js` 中没有 `<div>`、`<section>`、`<button>` 或 `<>` 这类 JSX 标签。
+
+### FastAPI 入口导入失败
+
+如果运行 `scripts/camera_web_fastapi.py` 时缺依赖：
+
+```bash
+pip3 install fastapi uvicorn
+```
+
+如果默认入口工作正常，而 FastAPI 入口性能或稳定性不符合预期，现场演示优先使用 `scripts/camera_web_preview.py`。
 
 ## 参考
 
