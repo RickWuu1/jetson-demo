@@ -164,8 +164,9 @@ function Dashboard() {
       ? "BACKDOOR ACTIVE"
       : (status.attack_on && status.mode === "normal" ? "BACKDOOR DORMANT" : (status.suspicious ? "SUSPICIOUS ATTENTION" : "SYSTEM CLEAR")));
   const threatTone = status.defense_applied ? "defended" : (status.backdoor_active ? "danger" : (status.attack_on && status.mode === "normal" ? "dormant" : "safe"));
+  const normalUsesInt8 = status.mode === "normal" && String(status.model || "").includes("INT8");
   const modeLabel = status.mode === "normal"
-    ? "Clean baseline"
+    ? (normalUsesInt8 ? "INT8 fallback" : "Clean baseline")
     : (status.mode === "triggered" ? "INT8 quantized" : "Defense mode");
 
   return h(
@@ -192,16 +193,28 @@ function Dashboard() {
       h(MetricCard, { label: "Attention Ratio", value: attentionRatio, hint: defenseText }),
     ),
     h("section", { className: "workspace" },
-      h("section", { className: "video-panel" },
-        h("div", { className: "panel-header" },
-          h("div", null,
-            h("h2", null, "Live Camera Feed"),
-            h("p", null, `${status.width || "-"}x${status.height || "-"} / ${status.target_fps || "-"} fps target / ${cacheText}`),
+      h("div", { className: "main-column" },
+        h("section", { className: "video-panel" },
+          h("div", { className: "panel-header" },
+            h("div", null,
+              h("h2", null, "Live Camera Feed"),
+              h("p", null, `${status.width || "-"}x${status.height || "-"} / ${status.target_fps || "-"} fps target / ${cacheText}`),
+            ),
+            h(StatusPill, { tone: "subtle" }, `source: ${status.actual_source || status.source || "-"}`),
           ),
-          h(StatusPill, { tone: "subtle" }, `source: ${status.actual_source || status.source || "-"}`),
+          h("div", { className: "stream-frame" },
+            h("img", { id: "stream", src: "/stream.mjpg", alt: "camera stream" }),
+          ),
         ),
-        h("div", { className: "stream-frame" },
-          h("img", { id: "stream", src: "/stream.mjpg", alt: "camera stream" }),
+        h("section", { className: "details-grid" },
+          h(DetailCard, { label: "Source" }, `${status.source || "-"} -> ${status.actual_source || "-"}`),
+          h(DetailCard, { label: "Frames / FPS" }, `${status.frame_index || "-"} / ${status.measured_fps || "-"} fps`),
+          h(DetailCard, { label: "QURA", tone: quraTone }, status.qura_available ? "available" : `unavailable: ${status.qura_error || "unknown"}`),
+          h(DetailCard, { label: "Runtime" }, runtime),
+          h(DetailCard, { label: "Top Predictions", wide: true }, topPredictions.length ? topPredictions.map((item) => `${item.label} (${item.confidence})`).join(" | ") : "-"),
+          h(DetailCard, { label: "Trigger / Backdoor", tone: backdoorTone }, `${status.attack_on ? "injected" : "off"} / ${status.backdoor_active ? "active" : (status.suspicious ? "suspicious" : "clear")}`),
+          h(DetailCard, { label: "Defense", tone: status.defense_on ? "ok" : "" }, defenseText),
+          h(DetailCard, { label: "Status", tone: error || status.last_error ? "error" : "ok", wide: true }, error || status.last_error || "ok"),
         ),
       ),
       h("aside", { className: "control-panel" },
@@ -218,7 +231,7 @@ function Dashboard() {
               active: status.mode === "normal",
               tone: "normal",
               title: "FP32 Baseline",
-              subtitle: "clean reference",
+              subtitle: normalUsesInt8 ? "FP32 unavailable" : "clean reference",
               onClick: () => postControl({ mode: "normal" }),
             }),
             h(ModeButton, {
@@ -272,17 +285,6 @@ function Dashboard() {
           h("strong", null, status.prediction || "-"),
           h("small", null, `confidence ${confidence} / attention ${attentionRatio}`),
         ),
-      ),
-    ),
-    h("section", { className: "details-grid" },
-      h(DetailCard, { label: "Source" }, `${status.source || "-"} -> ${status.actual_source || "-"}`),
-      h(DetailCard, { label: "Frames / FPS" }, `${status.frame_index || "-"} / ${status.measured_fps || "-"} fps`),
-      h(DetailCard, { label: "QURA", tone: quraTone }, status.qura_available ? "available" : `unavailable: ${status.qura_error || "unknown"}`),
-      h(DetailCard, { label: "Runtime" }, runtime),
-      h(DetailCard, { label: "Top Predictions", wide: true }, topPredictions.length ? topPredictions.map((item) => `${item.label} (${item.confidence})`).join(" | ") : "-"),
-      h(DetailCard, { label: "Trigger / Backdoor", tone: backdoorTone }, `${status.attack_on ? "injected" : "off"} / ${status.backdoor_active ? "active" : (status.suspicious ? "suspicious" : "clear")}`),
-      h(DetailCard, { label: "Defense", tone: status.defense_on ? "ok" : "" }, defenseText),
-      h(DetailCard, { label: "Status", tone: error || status.last_error ? "error" : "ok", wide: true }, error || status.last_error || "ok"),
     ),
   );
 }
