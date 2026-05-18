@@ -7,6 +7,8 @@ the standard-library server remains the default stable path.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -20,7 +22,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 try:
     import uvicorn
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 except ImportError as exc:
@@ -76,6 +78,10 @@ def mjpeg_stream(hub: FrameHub, fps: int):
         time.sleep(interval)
 
 
+def status_fingerprint(status: dict) -> str:
+    return json.dumps(status, sort_keys=True, default=str, separators=(",", ":"))
+
+
 def create_app(args) -> FastAPI:
     app = FastAPI(title="Jetson Backdoor Demo", docs_url="/docs", redoc_url=None)
     hub = create_hub(args)
@@ -122,6 +128,20 @@ def create_app(args) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/v1/status")
+    def status_v1():
+        return hub.status()
+
+    @app.post("/api/v1/control")
+    async def control_v1(request: Request):
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Expected JSON object")
+        try:
+            return hub.update_control(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/snapshot")
     def snapshot():
         frame = hub.latest_jpeg()
@@ -140,6 +160,22 @@ def create_app(args) -> FastAPI:
                 "Pragma": "no-cache",
             },
         )
+
+    @app.websocket("/ws/status")
+    async def websocket_status(websocket: WebSocket, interval_ms: int = 200):
+        await websocket.accept()
+        interval = max(50, min(2000, interval_ms)) / 1000.0
+        last_fingerprint = None
+        try:
+            while True:
+                current = hub.status()
+                fingerprint = status_fingerprint(current)
+                if fingerprint != last_fingerprint:
+                    await websocket.send_json(current)
+                    last_fingerprint = fingerprint
+                await asyncio.sleep(interval)
+        except WebSocketDisconnect:
+            return
 
     return app
 
