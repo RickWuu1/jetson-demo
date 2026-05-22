@@ -47,6 +47,18 @@ third_party/**/*.onnx
 outputs/jetson_imagenet_demo/
 
 # =========================
+# Claude Code
+# =========================
+.claude/
+
+# =========================
+# Local context / generated
+# =========================
+PROJECT_CONTEXT.md
+data_previews/
+allfiles.txt
+
+# =========================
 # Misc
 # =========================
 *.log

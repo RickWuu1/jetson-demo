@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import mimetypes
+from collections import deque
 import socket
 import sys
 import threading
@@ -58,6 +59,114 @@ class TrtClassificationBackbone:
 
     def is_backdoor_active(self, class_idx: int) -> bool:
         return class_idx == self.bd_target
+
+    def close(self) -> None:
+        pass
+
+
+class FireBackbone:
+    """Binary fire/no_fire ViT-B/16 head loaded from a fine-tuned checkpoint.
+
+    Maintains a sliding window of per-frame fire_prob values so the alarm
+    decision mirrors the video-level rule used during offline evaluation:
+      fire_alarm = (fraction of frames with fire_prob >= frame_thresh) >= fire_frame_thresh
+    """
+
+    def __init__(
+        self,
+        ckpt_path: Path,
+        device,
+        frame_thresh: float = 0.30,
+        window_size: int = 15,
+        fire_frame_thresh: float = 0.25,
+    ) -> None:
+        import torch
+        from PIL import Image as _Image
+        from torch import nn
+        from torchvision import models
+
+        self._torch = torch
+        self._Image = _Image
+        self.device = device
+        self.frame_thresh = frame_thresh
+        self.fire_frame_thresh = fire_frame_thresh
+        self._window: deque = deque(maxlen=window_size)
+
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        feature_dim = ckpt["feature_dim"]
+        self.class_to_idx: dict = ckpt["class_to_idx"]
+        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
+        self.fire_idx: int = self.class_to_idx["fire"]
+
+        weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+        backbone = models.vit_b_16(weights=weights)
+        backbone.heads = nn.Identity()
+        backbone.eval()
+        backbone.to(device)
+        for p in backbone.parameters():
+            p.requires_grad_(False)
+        self._backbone = backbone
+
+        head = nn.Linear(feature_dim, len(self.class_to_idx))
+        head.load_state_dict(ckpt["head_state_dict"])
+        head.eval()
+        head.to(device)
+        self._head = head
+        self._transform = weights.transforms()
+
+    @property
+    def fire_frame_ratio(self) -> float:
+        if not self._window:
+            return 0.0
+        return float(sum(p >= self.frame_thresh for p in self._window)) / len(self._window)
+
+    @property
+    def fire_alarm(self) -> bool:
+        return self.fire_frame_ratio >= self.fire_frame_thresh
+
+    @property
+    def latest_fire_prob(self) -> float:
+        return float(self._window[-1]) if self._window else 0.0
+
+    def predict_tensor_with_attention(self, x, topk: int = 2):
+        torch = self._torch
+        with torch.no_grad():
+            feat = self._backbone(x)
+            logits = self._head(feat)
+            probs = torch.softmax(logits, dim=1)[0]
+
+        fire_prob = float(probs[self.fire_idx].item())
+        self._window.append(fire_prob)
+
+        alarm = self.fire_alarm
+        n = len(self.class_to_idx)
+        class_idx = self.fire_idx if alarm else next(i for i in range(n) if i != self.fire_idx)
+        label = self.idx_to_class[class_idx]
+        conf = float(probs[class_idx].item())
+
+        top = sorted(
+            [{"class_idx": i, "confidence": float(probs[i].item()),
+              "label": self.idx_to_class[i], "display": self.idx_to_class[i]}
+             for i in range(n)],
+            key=lambda d: -d["confidence"],
+        )[:topk]
+
+        attn = np.ones(14 * 14, dtype=np.float32) / (14 * 14)
+        return class_idx, conf, label, top, attn
+
+    def predict_with_attention(self, frame_bgr, topk: int = 2):
+        Image = self._Image
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        x = self._transform(img).unsqueeze(0).to(self.device)
+        return self.predict_tensor_with_attention(x, topk=topk)
+
+    def classify(self, frame_bgr):
+        class_idx, conf, label, _, _ = self.predict_with_attention(frame_bgr, topk=1)
+        return class_idx, conf, label
+
+    def is_backdoor_active(self, class_idx: int) -> bool:
+        return False
 
     def close(self) -> None:
         pass
@@ -196,6 +305,34 @@ class RealtimeQuraPipeline:
         self.backend = args.backend
         self.trt_engine = args.trt_engine
         self.load_warnings = []
+        self.fire_mode = bool(getattr(args, "fire_checkpoint", None))
+        self.fire_backbone: Optional[object] = None
+
+        if self.fire_mode:
+            try:
+                import torch
+                self.torch = torch
+                self.torch_version = getattr(torch, "__version__", "unknown")
+                self.cuda_version = getattr(torch.version, "cuda", None)
+                self.device = torch.device(args.vit_device if torch.cuda.is_available() else "cpu")
+                self.device_name = str(self.device)
+                if self.device.type == "cuda":
+                    torch.backends.cudnn.benchmark = True
+                self.fire_backbone = FireBackbone(
+                    Path(args.fire_checkpoint),
+                    self.device,
+                    frame_thresh=getattr(args, "fire_prob_thresh", 0.30),
+                    window_size=getattr(args, "fire_window", 15),
+                    fire_frame_thresh=getattr(args, "fire_frame_thresh", 0.25),
+                )
+                self.model_names.append("FireViT-FP32")
+                self.available = True
+                LOGGER.info("Fire detection pipeline ready (device=%s): %s", self.device_name, args.fire_checkpoint)
+            except Exception as exc:
+                self.unavailable_reason = f"Fire backbone load failed: {type(exc).__name__}: {exc}"
+                LOGGER.error("Fire backbone: %s", self.unavailable_reason)
+                LOGGER.debug("Fire backbone traceback:\n%s", traceback.format_exc())
+            return
 
         if args.disable_qura:
             self.unavailable_reason = "disabled by --disable-qura"
@@ -295,12 +432,61 @@ class RealtimeQuraPipeline:
             LOGGER.debug("QURA pipeline traceback:\n%s", traceback.format_exc())
 
     def close(self) -> None:
-        for backbone in (self.fp32_backbone, self.qura_backbone, self.trt_backbone):
+        for backbone in (self.fire_backbone, self.fp32_backbone, self.qura_backbone, self.trt_backbone):
             if backbone is not None:
                 try:
                     backbone.close()
                 except Exception:
                     LOGGER.debug("Failed to close backbone", exc_info=True)
+
+    def _process_fire(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
+        assert self.fire_backbone is not None
+        try:
+            _, _, label, topk, _ = self.fire_backbone.predict_with_attention(frame, topk=2)
+            fire_prob = self.fire_backbone.latest_fire_prob
+            ratio = self.fire_backbone.fire_frame_ratio
+            alarm = self.fire_backbone.fire_alarm
+            n = len(self.fire_backbone.class_to_idx)
+            class_idx = self.fire_backbone.fire_idx if alarm else next(
+                i for i in range(n) if i != self.fire_backbone.fire_idx
+            )
+            return frame, {
+                "qura_available": True,
+                "qura_error": None,
+                "model": "FireViT-FP32",
+                "prediction": label,
+                "prediction_label": label,
+                "class_idx": class_idx,
+                "confidence": round(fire_prob if alarm else 1.0 - fire_prob, 4),
+                "topk": topk,
+                "backdoor_active": False,
+                "suspicious": False,
+                "defense_applied": False,
+                "inference_cached": False,
+                "attack_bbox": None,
+                "defense_bbox": None,
+                "patchdrop_boxes": None,
+                "attention_ratio": None,
+                "attention_peak_idx": None,
+                "attention_max": None,
+                "attention_avg": None,
+                "torch_version": self.torch_version,
+                "cuda_version": self.cuda_version,
+                "vit_device": self.device_name,
+                "backend": "torch",
+                "trt_engine": None,
+                "qura_warnings": self.load_warnings,
+                "fire_mode": True,
+                "fire_prob": round(fire_prob, 4),
+                "fire_frame_ratio": round(ratio, 4),
+                "fire_frame_thresh": self.fire_backbone.fire_frame_thresh,
+                "fire_alarm": alarm,
+            }
+        except Exception as exc:
+            LOGGER.warning("Fire inference failed: %s", exc)
+            m = self.status_metrics()
+            m["fire_mode"] = True
+            return frame, m
 
     def process(
         self,
@@ -312,6 +498,8 @@ class RealtimeQuraPipeline:
         force_inference: bool = True,
         cached_metrics: Optional[Dict[str, object]] = None,
     ) -> Tuple[np.ndarray, Dict[str, object]]:
+        if self.fire_mode and self.fire_backbone is not None:
+            return self._process_fire(frame)
         if not self.available or self.module is None:
             return frame, self.status_metrics()
 
@@ -469,7 +657,7 @@ class RealtimeQuraPipeline:
         }
 
     def status_metrics(self) -> Dict[str, object]:
-        return {
+        metrics: Dict[str, object] = {
             "qura_available": self.available,
             "qura_error": self.unavailable_reason,
             "model": "unavailable",
@@ -496,6 +684,16 @@ class RealtimeQuraPipeline:
             "trt_engine": self.trt_engine,
             "qura_warnings": self.load_warnings,
         }
+        if self.fire_mode:
+            fb = self.fire_backbone
+            metrics.update({
+                "fire_mode": True,
+                "fire_prob": None,
+                "fire_frame_ratio": None,
+                "fire_frame_thresh": fb.fire_frame_thresh if fb else 0.25,
+                "fire_alarm": False,
+            })
+        return metrics
 
     def _select_backbone(self, mode: str):
         if mode == "normal":
@@ -881,8 +1079,37 @@ class FrameHub:
             "attention_avg": None,
         }
 
+    def _decorate_fire_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
+        out = frame.copy()
+        h, w = out.shape[:2]
+        alarm = bool(metrics.get("fire_alarm", False))
+        fire_prob = float(metrics.get("fire_prob") or 0.0)
+        ratio = float(metrics.get("fire_frame_ratio") or 0.0)
+        thresh = float(metrics.get("fire_frame_thresh") or 0.25)
+        with self._lock:
+            measured_fps = self._measured_fps
+
+        bar_color = (0, 20, 160) if alarm else (10, 14, 20)
+        cv2.rectangle(out, (0, 0), (w, 84), bar_color, -1)
+
+        if alarm:
+            cv2.rectangle(out, (0, 0), (w - 1, h - 1), (0, 0, 220), 6)
+            cv2.putText(out, "FIRE DETECTED", (16, 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (40, 220, 255), 3)
+        else:
+            cv2.putText(out, "Lab Fire Detector  |  No Fire", (16, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.78, (100, 220, 100), 2)
+
+        status = f"fire_prob={fire_prob:.3f}  ratio={ratio:.2f}/{thresh:.2f}  fps={measured_fps:.1f}"
+        cv2.putText(out, status, (16, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (185, 210, 240), 1)
+        return out
+
     def _decorate_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
-        if self.overlay_style in {"off", "compact"}:
+        if self.overlay_style == "off":
+            return frame
+        if metrics.get("fire_mode"):
+            return self._decorate_fire_frame(frame, metrics)
+        if self.overlay_style == "compact":
             return frame
         with self._lock:
             mode = self._mode
@@ -1103,6 +1330,23 @@ def index_html() -> bytes:
       .status { justify-content: flex-start; }
       main { padding: 16px; }
     }
+    #fireAlertBanner { display: none; margin-bottom: 16px; }
+    .fire-status {
+      padding: 20px 24px; border-radius: 18px; text-align: center;
+      font-size: 32px; font-weight: 800; letter-spacing: -0.02em;
+      border: 2px solid var(--line); transition: all .3s ease;
+      background: linear-gradient(180deg, rgba(28,39,60,0.94), rgba(14,20,31,0.94));
+      color: var(--green);
+    }
+    .fire-status.alarm {
+      background: linear-gradient(180deg, rgba(160,20,20,0.95), rgba(100,10,10,0.95));
+      border-color: rgba(255,80,80,0.7); color: #fff;
+      animation: fire-pulse 1s ease-in-out infinite;
+    }
+    @keyframes fire-pulse {
+      0%, 100% { box-shadow: 0 0 20px rgba(255,60,60,0.3); }
+      50% { box-shadow: 0 0 50px rgba(255,60,60,0.75); }
+    }
   </style>
 </head>
 <body>
@@ -1118,6 +1362,10 @@ def index_html() -> bytes:
         <span class="pill" id="pipelinePill">pipeline: -</span>
       </div>
     </header>
+
+    <div id="fireAlertBanner">
+      <div id="fireStatusDiv" class="fire-status">Initializing fire detector...</div>
+    </div>
 
     <section class="hero">
       <div class="metric">
@@ -1204,6 +1452,8 @@ def index_html() -> bytes:
       <div class="card"><div class="label">Backdoor</div><div class="value" id="backdoor">-</div></div>
       <div class="card"><div class="label">Defense</div><div class="value" id="defense">-</div></div>
       <div class="card"><div class="label">Status</div><div class="value" id="error">-</div></div>
+      <div class="card" id="fireProbCard" style="display:none"><div class="label">Fire Prob (frame)</div><div class="value" id="fireProb">-</div></div>
+      <div class="card" id="fireRatioCard" style="display:none"><div class="label">Fire Frame Ratio</div><div class="value" id="fireRatio">-</div></div>
     </section>
   </main>
 
@@ -1277,6 +1527,31 @@ def index_html() -> bytes:
       document.getElementById('defenseBtn').textContent = `Defense: ${data.defense_on ? 'ON' : 'OFF'}`;
       document.getElementById('defenseBtn').classList.toggle('active', data.defense_on);
       document.getElementById('defenseModeBtn').textContent = `Defense Mode: ${data.defense_mode}`;
+
+      // Fire detection mode
+      if (data.fire_mode) {
+        const banner = document.getElementById('fireAlertBanner');
+        if (banner) banner.style.display = 'block';
+        const statusDiv = document.getElementById('fireStatusDiv');
+        if (statusDiv) {
+          statusDiv.textContent = data.fire_alarm ? 'FIRE DETECTED' : 'No Fire Detected';
+          statusDiv.className = data.fire_alarm ? 'fire-status alarm' : 'fire-status';
+        }
+        const fpCard = document.getElementById('fireProbCard');
+        const frCard = document.getElementById('fireRatioCard');
+        if (fpCard) fpCard.style.display = '';
+        if (frCard) frCard.style.display = '';
+        text('fireProb', data.fire_prob != null ? (data.fire_prob * 100).toFixed(1) + '%' : '-');
+        const thresh = data.fire_frame_thresh != null ? (data.fire_frame_thresh * 100).toFixed(0) : '25';
+        text('fireRatio', data.fire_frame_ratio != null
+          ? (data.fire_frame_ratio * 100).toFixed(0) + '% / ' + thresh + '%'
+          : '-');
+        const predHero = document.getElementById('predictionHero');
+        if (predHero) {
+          predHero.textContent = data.fire_alarm ? 'FIRE' : 'no fire';
+          predHero.style.color = data.fire_alarm ? 'var(--red)' : 'var(--green)';
+        }
+      }
     }
 
     async function refreshStatus() {
@@ -1496,6 +1771,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blur-kernel", type=int, default=31)
     parser.add_argument("--blur-sigma", type=float, default=6.0)
     parser.add_argument("--int8-only", action="store_true")
+    # --- fire detection mode ---
+    parser.add_argument("--fire-checkpoint", default=None,
+                        help="Fine-tuned fire/no_fire ViT head checkpoint (.pt). Enables fire detection mode.")
+    parser.add_argument("--fire-prob-thresh", type=float, default=0.30,
+                        help="Per-frame fire_prob threshold for the sliding window (default: 0.30)")
+    parser.add_argument("--fire-frame-thresh", type=float, default=0.25,
+                        help="Fraction of fire frames needed to trigger alarm (default: 0.25)")
+    parser.add_argument("--fire-window", type=int, default=15,
+                        help="Sliding window size in frames (default: 15)")
     return parser.parse_args()
 
 

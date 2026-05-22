@@ -5,6 +5,7 @@
 - 离线结果展示：FP32 ViT 在 Jetson 上现场推理，INT8-QURA 与防御结果使用 x86 预计算结果回放。
 - 实时摄像头展示：通过浏览器查看摄像头或视频流，并接入真实 QURA/ViT 推理、防御和注意力指标。
 - 部署优化试点：可选 TensorRT 分类后端、React 预览界面和 FastAPI 入口，用于逐步验证工程化部署方案。
+- 实验室小火苗二分类（并行支线）：ViT-B/16 冻结 backbone + 线性头，识别打火机/蜡烛/酒精灯等小火焰；`--fire-checkpoint` 模式已接入实时摄像头前端。
 
 ## 当前能力
 
@@ -61,6 +62,39 @@ Input Image
 | `/api/snapshot` | GET | 当前帧快照 |
 | `/react` | GET | React 预览版控制台（可选） |
 | `/docs` | GET | FastAPI 入口的 API 文档（仅 `camera_web_fastapi.py`） |
+
+### 实验室小火苗二分类（并行支线）
+
+ViT-B/16 冻结 backbone + 线性头，在 Windows 本地完成三轮微调，用于识别打火机/蜡烛/酒精灯等实验室小火焰。微调权重已通过 `--fire-checkpoint` 接入 `camera_web_preview.py`，内含 `FireBackbone`（滑动窗口决策 + 告警 UI）。
+
+| 阶段 | 测试集（视频段数） | Accuracy | Precision | Recall | F1 |
+|------|-------------------|----------|-----------|--------|----|
+| 第一轮（2026-05-21） | test_split.json v1.3（34 段，含泄露） | 64.7% | 62.1% | 94.7% | 75.0% |
+| 第二轮（2026-05-22） | test_split_v2.json（35 段，零泄露） | 85.7% | 88.9% | 84.2% | 86.5% |
+| **第三轮（2026-05-22，当前）** | test_split_v2.json（35 段） | **97.14%** | **95.0%** | **100.0%** | **97.44%** |
+
+第三轮改进（在第二轮基础上新增 Pexels 数据后重训）：
+- 正样本：alcohol_lamp_style×5 + dim_candle×5 共 10 段 Pexels 视频（每段抽 15 帧）
+- 负样本：phone_screen×4 + warm_lamp×4 共 8 段 Pexels 视频（每段抽 15 帧）
+- Val 图像分类：F1=96.49%，P=100%，R=93.22%，Acc=97.37%（best epoch 10）
+- 剩余 1 FP：person_v2_02（行人场景，fire_frame_ratio=0.267）；0 FN
+- 决策阈值：`frame_thresh=0.30`、`fire_frame_thresh=0.25`、`window=15`
+
+相关脚本：`scripts/finetune_lab_fire_vit.py`、`scripts/test_vit_on_videos.py`
+
+产物：`outputs/lab_fire_vit/lab_fire_vit_head_best.pt`、`outputs/lab_fire_vit_video_test/summary_v2.json`
+
+火焰检测模式启动（USB 摄像头）：
+
+```bash
+python scripts/camera_web_preview.py \
+  --source usb \
+  --fire-checkpoint outputs/lab_fire_vit/lab_fire_vit_head_best.pt \
+  --disable-qura \
+  --fire-prob-thresh 0.30 \
+  --fire-frame-thresh 0.25 \
+  --fire-window 15
+```
 
 ## 目录结构
 
