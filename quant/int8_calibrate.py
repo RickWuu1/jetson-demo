@@ -23,9 +23,9 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from utils.logger import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class DataLoaderCalibrationReader(CalibrationDataReader):
@@ -101,7 +101,7 @@ def calibrate_and_quantize(
         max_batches=max_calibration_batches,
     )
 
-    logger.info(f"Quantizing {fp32_onnx_path} → {output_int8_path}")
+    logger.info(f"Quantizing {fp32_onnx_path} -> {output_int8_path}")
     logger.info(f"  per_channel={per_channel}, reduce_range={reduce_range}")
 
     quantize_static(

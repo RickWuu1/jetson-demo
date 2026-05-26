@@ -42,14 +42,14 @@ third_party/**/*.pth
 third_party/**/*.onnx
 
 # =========================
-# Jetson / demo outputs
-# =========================
-outputs/jetson_imagenet_demo/
-
-# =========================
 # Claude Code
 # =========================
 .claude/
+
+# =========================
+# IDE
+# =========================
+.vscode/
 
 # =========================
 # Local context / generated
@@ -59,8 +59,16 @@ data_previews/
 allfiles.txt
 
 # =========================
+# Scripts — local/generated, not tracked
+# =========================
+scripts/*.pptx
+scripts/gen_meeting_slides.py
+
+# =========================
 # Misc
 # =========================
 *.log
 *.tmp
 *.cache
+Thumbs.db
+.ipynb_checkpoints/

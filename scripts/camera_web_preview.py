@@ -64,6 +64,69 @@ class TrtClassificationBackbone:
         pass
 
 
+def _remap_qura_backbone_sd(qura_sd: dict) -> dict:
+    """Convert a QURA-quantized backbone state_dict to torchvision vit_b_16 format.
+
+    QURA replaces fused nn.MultiheadAttention with separate q/k/v QuantizedLinear
+    modules and adds weight_quantizer / activation_quantizer sub-keys.  This function:
+      - merges q_proj / k_proj / v_proj weights back into in_proj_weight / in_proj_bias
+      - strips all quantizer sub-keys
+      - passes remaining keys through unchanged
+    """
+    import torch as _torch
+
+    out = {}
+    # Group q/k/v weights by layer prefix so we can cat them
+    qkv_w: dict = {}  # prefix -> {q/k/v: tensor}
+    qkv_b: dict = {}
+
+    for k, v in qura_sd.items():
+        # Skip quantizer calibration params — not present in vanilla model
+        if "weight_quantizer" in k or "activation_quantizer" in k:
+            continue
+        # Detect split projection keys
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            if f".self_attention.{proj}.weight" in k:
+                prefix = k[: k.index(f".self_attention.{proj}.weight")]
+                qkv_w.setdefault(prefix, {})[proj] = v
+                break
+            if f".self_attention.{proj}.bias" in k:
+                prefix = k[: k.index(f".self_attention.{proj}.bias")]
+                qkv_b.setdefault(prefix, {})[proj] = v
+                break
+        else:
+            out[k] = v
+
+    # Reconstruct fused in_proj_weight / in_proj_bias
+    for prefix, projs in qkv_w.items():
+        if all(p in projs for p in ("q_proj", "k_proj", "v_proj")):
+            out[f"{prefix}.self_attention.in_proj_weight"] = _torch.cat(
+                [projs["q_proj"], projs["k_proj"], projs["v_proj"]], dim=0
+            )
+    for prefix, projs in qkv_b.items():
+        if all(p in projs for p in ("q_proj", "k_proj", "v_proj")):
+            out[f"{prefix}.self_attention.in_proj_bias"] = _torch.cat(
+                [projs["q_proj"], projs["k_proj"], projs["v_proj"]], dim=0
+            )
+
+    return out
+
+
+def _draw_label_box(frame: np.ndarray, box, color, text: str, thickness: int = 2) -> None:
+    """Draw a labeled rectangle border on `frame` in-place (matches draw_overlay_box style)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, th = 0.52, 1
+    text_w, text_h = cv2.getTextSize(text, font, scale, th)[0]
+    tx = max(2, min(x1, w - text_w - 2))
+    ty = y1 - 6
+    if ty < text_h + 2:
+        ty = min(h - 2, y2 + text_h + 4)
+    cv2.putText(frame, text, (tx, ty), font, scale, color, th)
+
+
 class FireBackbone:
     """Binary fire/no_fire ViT-B/16 head loaded from a fine-tuned checkpoint.
 
@@ -107,12 +170,24 @@ class FireBackbone:
             p.requires_grad_(False)
         self._backbone = backbone
 
+        if "backbone_state_dict" in ckpt:
+            backbone.load_state_dict(
+                _remap_qura_backbone_sd(ckpt["backbone_state_dict"]),
+                strict=False,
+            )
+
         head = nn.Linear(feature_dim, len(self.class_to_idx))
         head.load_state_dict(ckpt["head_state_dict"])
         head.eval()
         head.to(device)
         self._head = head
         self._transform = weights.transforms()
+
+        try:
+            from defenses.regiondrop.region_detector import AttentionHook
+            self._attn_hook = AttentionHook(self._backbone)
+        except Exception:
+            self._attn_hook = None
 
     @property
     def fire_frame_ratio(self) -> float:
@@ -151,8 +226,19 @@ class FireBackbone:
             key=lambda d: -d["confidence"],
         )[:topk]
 
-        attn = np.ones(14 * 14, dtype=np.float32) / (14 * 14)
+        if self._attn_hook is not None:
+            attn = self._attn_hook.get_cls_attention_map(reduce="mean")
+        else:
+            attn = np.ones(196, dtype=np.float32) / 196.0
         return class_idx, conf, label, top, attn
+
+    def get_attention_from_tensor(self, x) -> np.ndarray:
+        """Forward pass through frozen backbone only, return CLS attention without updating window."""
+        with self._torch.no_grad():
+            self._backbone(x)
+        if self._attn_hook is not None:
+            return self._attn_hook.get_cls_attention_map(reduce="mean")
+        return np.ones(196, dtype=np.float32) / 196.0
 
     def predict_with_attention(self, frame_bgr, topk: int = 2):
         Image = self._Image
@@ -170,6 +256,479 @@ class FireBackbone:
 
     def close(self) -> None:
         pass
+
+
+class FireOrtBackbone:
+    """INT8 ORT inference for backdoored FireViT.
+
+    Shares the same sliding-window alarm logic as FireBackbone so the two
+    are interchangeable from the caller's perspective.
+    """
+
+    MEAN = (0.485, 0.456, 0.406)
+    STD  = (0.229, 0.224, 0.225)
+
+    def __init__(
+        self,
+        onnx_path: Path,
+        class_to_idx: dict,
+        frame_thresh: float = 0.30,
+        window_size: int = 15,
+        fire_frame_thresh: float = 0.25,
+    ) -> None:
+        import onnxruntime as ort
+        self.sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        self.input_name = self.sess.get_inputs()[0].name
+        self.class_to_idx = class_to_idx
+        self.idx_to_class = {v: k for k, v in class_to_idx.items()}
+        self.fire_idx = class_to_idx["fire"]
+        self.frame_thresh = frame_thresh
+        self.fire_frame_thresh = fire_frame_thresh
+        self._window: deque = deque(maxlen=window_size)
+
+    @property
+    def fire_frame_ratio(self) -> float:
+        if not self._window:
+            return 0.0
+        return float(sum(p >= self.frame_thresh for p in self._window)) / len(self._window)
+
+    @property
+    def fire_alarm(self) -> bool:
+        return self.fire_frame_ratio >= self.fire_frame_thresh
+
+    @property
+    def latest_fire_prob(self) -> float:
+        return float(self._window[-1]) if self._window else 0.0
+
+    def _preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """BGR frame -> (1,3,224,224) float32 numpy, ImageNet-normalised."""
+        import cv2 as _cv2
+        rgb = _cv2.cvtColor(frame_bgr, _cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        scale = 256.0 / min(h, w)
+        rgb = _cv2.resize(rgb, (int(round(w * scale)), int(round(h * scale))),
+                          interpolation=_cv2.INTER_LINEAR)
+        nh, nw = rgb.shape[:2]
+        top  = (nh - 224) // 2
+        left = (nw - 224) // 2
+        rgb  = rgb[top:top + 224, left:left + 224]
+        x = rgb.astype(np.float32) / 255.0
+        mean = np.array(self.MEAN, dtype=np.float32)
+        std  = np.array(self.STD,  dtype=np.float32)
+        x = (x - mean) / std
+        return x.transpose(2, 0, 1)[np.newaxis]  # (1,3,224,224)
+
+    def predict(self, frame_bgr: np.ndarray,
+                trigger_norm=None, drop_trigger: bool = False) -> tuple:
+        """
+        Run ORT inference and update the sliding window.
+
+        Args:
+            frame_bgr   : raw camera frame
+            trigger_norm: torch.Tensor CHW normalized trigger (paste bottom-right)
+            drop_trigger: if True, zero the trigger region AFTER pasting (oracle defence)
+
+        Returns:
+            (fire_prob, alarm, class_idx, label, topk)
+        """
+        x = self._preprocess(frame_bgr)  # (1,3,224,224) float32
+
+        if trigger_norm is not None:
+            t = trigger_norm.float().numpy()       # (3,ph,pw)
+            if t.ndim == 4:
+                t = t[0]
+            ph, pw = t.shape[1], t.shape[2]
+            if drop_trigger:
+                # oracle defence: restore clean pixels instead of trigger
+                pass  # skip paste — x already clean
+            else:
+                x = x.copy()
+                x[0, :, -ph:, -pw:] = t
+
+        logits = self.sess.run(None, {self.input_name: x})[0]  # (1,2)
+        probs = self._softmax(logits[0])
+        fire_prob = float(probs[self.fire_idx])
+        self._window.append(fire_prob)
+
+        alarm = self.fire_alarm
+        n = len(self.class_to_idx)
+        class_idx = self.fire_idx if alarm else next(i for i in range(n) if i != self.fire_idx)
+        label = self.idx_to_class[class_idx]
+        topk = sorted(
+            [{"class_idx": i, "confidence": float(probs[i]),
+              "label": self.idx_to_class[i], "display": self.idx_to_class[i]}
+             for i in range(n)],
+            key=lambda d: -d["confidence"],
+        )[:2]
+        return fire_prob, alarm, class_idx, label, topk
+
+    def predict_from_array(self, x_np: np.ndarray) -> tuple:
+        """Run ORT on an already-preprocessed (1,3,224,224) float32 array."""
+        logits = self.sess.run(None, {self.input_name: x_np})[0]
+        probs = self._softmax(logits[0])
+        fire_prob = float(probs[self.fire_idx])
+        self._window.append(fire_prob)
+        alarm = self.fire_alarm
+        n = len(self.class_to_idx)
+        class_idx = self.fire_idx if alarm else next(i for i in range(n) if i != self.fire_idx)
+        label = self.idx_to_class[class_idx]
+        topk = sorted(
+            [{"class_idx": i, "confidence": float(probs[i]),
+              "label": self.idx_to_class[i], "display": self.idx_to_class[i]}
+             for i in range(n)],
+            key=lambda d: -d["confidence"],
+        )[:2]
+        return fire_prob, alarm, class_idx, label, topk
+
+    @staticmethod
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        e = np.exp(x - x.max())
+        return e / e.sum()
+
+    def close(self) -> None:
+        pass
+
+
+class FireQuraAttentionBackbone:
+    """Loads fire_qura_ptq.py checkpoint in fake-quant mode to extract INT8-sensitive attention.
+
+    The QURA trigger is FP32-dormant: FP32 attention cannot locate it.  In INT8
+    mode the attention concentrates strongly on the trigger patch, enabling
+    proper regionblur / patchdrop defense.
+
+    Raises ValueError for non-QURA checkpoints (e.g. fire_backdoor_finetune.py,
+    which saves a plain FP32 model without QuantizedLinear layers).
+    """
+
+    _W_QMODE = "per_layer_symmetric"
+    _A_QMODE = "per_layer_asymmetric"
+    _N_BITS  = 8
+
+    MEAN = (0.485, 0.456, 0.406)
+    STD  = (0.229, 0.224, 0.225)
+
+    def __init__(
+        self,
+        ckpt_path: Path,
+        device,
+        frame_thresh: float = 0.30,
+        window_size: int = 15,
+        fire_frame_thresh: float = 0.25,
+    ) -> None:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as _F
+        from torchvision import models
+
+        _quanti = REPO_ROOT / "third_party" / "quanti_repro" / "Qu-ANTI-zation"
+        if str(_quanti) not in sys.path:
+            sys.path.insert(0, str(_quanti))
+        from utils.qutils import QuantizedLinear, QuantizedConv2d
+
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        sd = ckpt.get("backbone_state_dict", {})
+        if not any("q_proj" in k or "weight_quantizer" in k for k in sd.keys()):
+            raise ValueError(
+                f"Not a fire_qura_ptq checkpoint (no fake-quant keys): {ckpt_path.name}"
+            )
+
+        self._torch = torch
+        self.device = device
+        self._QuantizedLinear = QuantizedLinear
+        self._QuantizedConv2d = QuantizedConv2d
+        self._attn_list: list = []
+
+        self.frame_thresh = frame_thresh
+        self.fire_frame_thresh = fire_frame_thresh
+        self._window: deque = deque(maxlen=window_size)
+        self._last_attn: "Optional[np.ndarray]" = None
+        class_to_idx = ckpt.get("class_to_idx", {"fire": 0, "no_fire": 1})
+        self.class_to_idx = class_to_idx
+        self.idx_to_class = {v: k for k, v in class_to_idx.items()}
+        self.fire_idx = class_to_idx.get("fire", 0)
+
+        attn_list = self._attn_list  # closure captured by nested classes
+
+        class _QLSeq(QuantizedLinear):
+            def forward(self_, inputs):
+                if self_.quantization:
+                    orig = inputs.shape
+                    if inputs.dim() > 2:
+                        flat = inputs.reshape(-1, inputs.shape[-1])
+                        flat = self_.activation_quantizer(flat)
+                        inputs = flat.reshape(orig)
+                    else:
+                        inputs = self_.activation_quantizer(inputs)
+                    w = self_.weight_quantizer(self_.weight)
+                    return _F.linear(inputs, w, self_.bias)
+                return _F.linear(inputs, self_.weight, self_.bias)
+
+        class _QMHA(nn.Module):
+            def __init__(self_, orig: nn.MultiheadAttention) -> None:
+                super().__init__()
+                E, H = orig.embed_dim, orig.num_heads
+                bias = orig.in_proj_bias is not None
+                self_.q_proj   = _QLSeq(E, E, bias=bias)
+                self_.k_proj   = _QLSeq(E, E, bias=bias)
+                self_.v_proj   = _QLSeq(E, E, bias=bias)
+                self_.out_proj = _QLSeq(E, E, bias=orig.out_proj.bias is not None)
+                with torch.no_grad():
+                    w = orig.in_proj_weight.data
+                    self_.q_proj.weight.copy_(w[:E])
+                    self_.k_proj.weight.copy_(w[E:2*E])
+                    self_.v_proj.weight.copy_(w[2*E:])
+                    if bias:
+                        b = orig.in_proj_bias.data
+                        self_.q_proj.bias.copy_(b[:E])
+                        self_.k_proj.bias.copy_(b[E:2*E])
+                        self_.v_proj.bias.copy_(b[2*E:])
+                    self_.out_proj.weight.copy_(orig.out_proj.weight.data)
+                    if orig.out_proj.bias is not None:
+                        self_.out_proj.bias.copy_(orig.out_proj.bias.data)
+                self_.num_heads = H
+                self_.head_dim  = E // H
+                self_.embed_dim = E
+                self_.dropout_p = orig.dropout
+
+            def forward(self_, q, k, v, key_padding_mask=None, need_weights=True, attn_mask=None):
+                B, S, E = q.shape
+                H, d = self_.num_heads, self_.head_dim
+                qq = self_.q_proj(q).view(B, S, H, d).transpose(1, 2)
+                kk = self_.k_proj(k).view(B, S, H, d).transpose(1, 2)
+                vv = self_.v_proj(v).view(B, S, H, d).transpose(1, 2)
+                a = (qq @ kk.transpose(-2, -1)) * (d ** -0.5)
+                if attn_mask is not None:
+                    a = a + attn_mask
+                if key_padding_mask is not None:
+                    a = a.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+                a = _F.softmax(a, dim=-1)
+                attn_list.append(a.detach())  # captured per-block during forward
+                return self_.out_proj((a @ vv).transpose(1, 2).reshape(B, S, E)), None
+
+        def _convert(module: nn.Module) -> None:
+            for name, child in list(module.named_children()):
+                if isinstance(child, nn.MultiheadAttention):
+                    setattr(module, name, _QMHA(child))
+                elif isinstance(child, nn.Linear):
+                    ql = _QLSeq(child.in_features, child.out_features,
+                                 bias=child.bias is not None)
+                    with torch.no_grad():
+                        ql.weight.copy_(child.weight)
+                        if child.bias is not None:
+                            ql.bias.copy_(child.bias)
+                    setattr(module, name, ql)
+                elif isinstance(child, nn.Conv2d):
+                    qc = QuantizedConv2d(
+                        child.in_channels, child.out_channels, child.kernel_size,
+                        stride=child.stride, padding=child.padding,
+                        dilation=child.dilation, groups=child.groups,
+                        bias=child.bias is not None,
+                    )
+                    with torch.no_grad():
+                        qc.weight.copy_(child.weight)
+                        if child.bias is not None:
+                            qc.bias.copy_(child.bias)
+                    setattr(module, name, qc)
+                else:
+                    _convert(child)
+
+        backbone = models.vit_b_16(weights=None)
+        backbone.heads = nn.Identity()
+        _convert(backbone)
+
+        # Phase 1: call enable_quantization to CREATE quantizer sub-modules
+        # (QuantizedLinear.__init__ does NOT create them; enable_quantization does)
+        for module in backbone.modules():
+            if isinstance(module, (QuantizedLinear, QuantizedConv2d)):
+                module.enable_quantization(self._W_QMODE, self._A_QMODE, self._N_BITS)
+
+        # Phase 2: load calibrated quantizer ranges from QURA checkpoint
+        missing, unexpected = backbone.load_state_dict(sd, strict=False)
+        LOGGER.info(
+            "FireQuraAttn: %d loaded, %d missing, %d unexpected",
+            len(sd) - len(missing), len(missing), len(unexpected),
+        )
+
+        # Phase 3: disable quantization and freeze tracker ranges for inference
+        for module in backbone.modules():
+            if isinstance(module, (QuantizedLinear, QuantizedConv2d)):
+                module.disable_quantization()
+                for attr in ("weight_quantizer", "activation_quantizer"):
+                    q = getattr(module, attr, None)
+                    if q is not None and hasattr(q, "range_tracker"):
+                        q.range_tracker.track = False
+
+        backbone = backbone.to(device)
+        backbone.eval()
+        self.backbone = backbone
+
+        self._head = None
+        if "head_state_dict" in ckpt:
+            head_sd = ckpt["head_state_dict"]
+            w = head_sd.get("weight")
+            feature_dim = int(w.shape[1]) if w is not None else 768
+            n_classes = len(class_to_idx)
+            head = nn.Linear(feature_dim, n_classes)
+            head.load_state_dict(head_sd)
+            head.eval()
+            head.to(device)
+            self._head = head
+
+    @property
+    def fire_frame_ratio(self) -> float:
+        if not self._window:
+            return 0.0
+        return float(sum(p >= self.frame_thresh for p in self._window)) / len(self._window)
+
+    @property
+    def fire_alarm(self) -> bool:
+        return self.fire_frame_ratio >= self.fire_frame_thresh
+
+    @property
+    def latest_fire_prob(self) -> float:
+        return float(self._window[-1]) if self._window else 0.0
+
+    def _preprocess(self, frame_bgr: "np.ndarray") -> "np.ndarray":
+        """BGR frame -> (1,3,224,224) float32 numpy, ImageNet-normalised."""
+        import cv2 as _cv2
+        import numpy as _np
+        rgb = _cv2.cvtColor(frame_bgr, _cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        scale = 256.0 / min(h, w)
+        rgb = _cv2.resize(rgb, (int(round(w * scale)), int(round(h * scale))),
+                          interpolation=_cv2.INTER_LINEAR)
+        nh, nw = rgb.shape[:2]
+        top  = (nh - 224) // 2
+        left = (nw - 224) // 2
+        rgb  = rgb[top:top + 224, left:left + 224]
+        x = rgb.astype(_np.float32) / 255.0
+        mean = _np.array(self.MEAN, dtype=_np.float32)
+        std  = _np.array(self.STD,  dtype=_np.float32)
+        x = (x - mean) / std
+        return x.transpose(2, 0, 1)[_np.newaxis]
+
+    def _int8_forward_split(self, x_np: "np.ndarray") -> tuple:
+        """Prefix-FP32 + suffix-INT8 forward matching fire_qura_defense_eval.int8_forward.
+
+        Blocks 0-7 run in FP32. Blocks 8-11 + head run with fresh enable_quantization
+        per call (dynamic per-batch calibration, momentum=1), exactly replicating the
+        training/eval path that achieves ASR=100%.
+        Returns (probs_np, attn_196_np).
+        """
+        import numpy as _np
+        torch = self._torch
+        _N_FROZEN = 8
+        x = torch.from_numpy(x_np).to(self.device)
+        self._attn_list.clear()
+
+        # Prefix: blocks 0-7 in FP32
+        with torch.no_grad():
+            xp = self.backbone._process_input(x)
+            n = xp.shape[0]
+            cls = self.backbone.class_token.expand(n, -1, -1)
+            xp = torch.cat([cls, xp], dim=1) + self.backbone.encoder.pos_embedding
+            for i in range(_N_FROZEN):
+                xp = self.backbone.encoder.layers[i](xp)
+
+        # Suffix: blocks 8-11 + head in INT8 (fresh quantization, calibrates on current input)
+        self._attn_list.clear()
+        head_mods = list(self._head.modules()) if self._head is not None else []
+        q_mods = [m for m in list(self.backbone.modules()) + head_mods
+                  if isinstance(m, (self._QuantizedLinear, self._QuantizedConv2d))]
+        for m in q_mods:
+            m.enable_quantization(self._W_QMODE, self._A_QMODE, self._N_BITS)
+            m.weight_quantizer = m.weight_quantizer.to(self.device)
+            m.activation_quantizer = m.activation_quantizer.to(self.device)
+        try:
+            with torch.no_grad():
+                xs = xp
+                for i in range(_N_FROZEN, len(self.backbone.encoder.layers)):
+                    xs = self.backbone.encoder.layers[i](xs)
+                xs = self.backbone.encoder.dropout(xs)
+                xs = self.backbone.encoder.ln(xs)
+                feat = xs[:, 0]
+                if self._head is not None:
+                    logits = self._head(feat)
+                    probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+                else:
+                    nc = len(self.class_to_idx)
+                    probs = _np.ones(nc, dtype=_np.float32) / nc
+        finally:
+            for m in q_mods:
+                m.disable_quantization()
+
+        if self._attn_list:
+            last = self._attn_list[-1]       # (1, H, 197, 197)
+            cls_patch = last[0, :, 0, 1:]    # (H, 196)
+            attn = cls_patch.std(dim=0).cpu().numpy().astype("float32")
+        else:
+            attn = _np.ones(196, dtype=_np.float32) / 196.0
+        self._last_attn = attn
+        return probs, attn
+
+    def predict_from_array(self, x_np: "np.ndarray") -> tuple:
+        """INT8-mode forward + head. Returns (fire_prob, alarm, class_idx, label, topk)."""
+        import numpy as _np
+        probs, _ = self._int8_forward_split(x_np)
+        fire_prob = float(probs[self.fire_idx])
+        self._window.append(fire_prob)
+        alarm = self.fire_alarm
+        n = len(self.class_to_idx)
+        class_idx = self.fire_idx if alarm else next(i for i in range(n) if i != self.fire_idx)
+        label = self.idx_to_class[class_idx]
+        topk = sorted(
+            [{"class_idx": i, "confidence": float(probs[i]),
+              "label": self.idx_to_class[i], "display": self.idx_to_class[i]}
+             for i in range(n)],
+            key=lambda d: -d["confidence"],
+        )[:2]
+        return fire_prob, alarm, class_idx, label, topk
+
+    def get_attention_int8(self, x_np: "np.ndarray") -> "np.ndarray":
+        """INT8-mode forward; return CLS→patch attention (196,) from the last suffix block.
+
+        Uses the same prefix-FP32 + suffix-INT8 split as predict_from_array so
+        attention concentrates on the trigger patch (FP32 attention is QURA-dormant).
+        """
+        _, attn = self._int8_forward_split(x_np)
+        return attn
+
+    def close(self) -> None:
+        pass
+
+
+def _load_fire_trigger_norm(path: str) -> "Optional[torch.Tensor]":
+    """Load fire trigger .pt (QURA format) -> normalized CHW tensor, or None."""
+    try:
+        import torch
+        import torch.nn.functional as F
+        p = Path(path)
+        if not p.exists():
+            LOGGER.warning("Fire trigger not found: %s", path)
+            return None
+        obj = torch.load(str(p), map_location="cpu")
+        if isinstance(obj, dict):
+            for key in ("norm", "trigger", "patch"):
+                if key in obj:
+                    obj = obj[key]
+                    break
+        t = torch.as_tensor(obj).float()
+        if t.dim() == 4 and t.shape[0] == 1:
+            t = t.squeeze(0)
+        if t.dim() == 3 and t.shape[0] not in (1, 3) and t.shape[-1] in (1, 3):
+            t = t.permute(2, 0, 1)
+        if t.dim() == 3 and t.shape[0] == 1:
+            t = t.expand(3, -1, -1)
+        # normalise if still in [0,1]
+        if float(t.min()) >= 0.0 and float(t.max()) <= 1.0:
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+            std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+            t = (t - mean) / std
+        LOGGER.info("Fire trigger loaded: %s  shape=%s", p.name, tuple(t.shape))
+        return t.cpu()
+    except Exception as exc:
+        LOGGER.warning("Failed to load fire trigger %s: %s", path, exc)
+        return None
 
 
 def load_cv_deps() -> None:
@@ -307,6 +866,9 @@ class RealtimeQuraPipeline:
         self.load_warnings = []
         self.fire_mode = bool(getattr(args, "fire_checkpoint", None))
         self.fire_backbone: Optional[object] = None
+        self.fire_int8_backbone: Optional[FireOrtBackbone] = None
+        self.fire_qura_attn: Optional[FireQuraAttentionBackbone] = None
+        self.fire_trigger_norm = None  # normalized CHW tensor for fire backdoor demo
 
         if self.fire_mode:
             try:
@@ -318,16 +880,61 @@ class RealtimeQuraPipeline:
                 self.device_name = str(self.device)
                 if self.device.type == "cuda":
                     torch.backends.cudnn.benchmark = True
+
+                frame_thresh      = getattr(args, "fire_prob_thresh", 0.30)
+                window_size       = getattr(args, "fire_window", 15)
+                fire_frame_thresh = getattr(args, "fire_frame_thresh", 0.25)
+
+                # FP32 clean backbone (normal mode)
                 self.fire_backbone = FireBackbone(
                     Path(args.fire_checkpoint),
                     self.device,
-                    frame_thresh=getattr(args, "fire_prob_thresh", 0.30),
-                    window_size=getattr(args, "fire_window", 15),
-                    fire_frame_thresh=getattr(args, "fire_frame_thresh", 0.25),
+                    frame_thresh=frame_thresh,
+                    window_size=window_size,
+                    fire_frame_thresh=fire_frame_thresh,
                 )
                 self.model_names.append("FireViT-FP32")
                 self.available = True
-                LOGGER.info("Fire detection pipeline ready (device=%s): %s", self.device_name, args.fire_checkpoint)
+                LOGGER.info("Fire detection pipeline ready (device=%s): %s",
+                            self.device_name, args.fire_checkpoint)
+
+                # INT8 backdoored backbone (triggered / defended modes)
+                fire_int8_path = getattr(args, "fire_int8_path", None)
+                if fire_int8_path and Path(fire_int8_path).exists():
+                    try:
+                        self.fire_int8_backbone = FireOrtBackbone(
+                            Path(fire_int8_path),
+                            self.fire_backbone.class_to_idx,
+                            frame_thresh=frame_thresh,
+                            window_size=window_size,
+                            fire_frame_thresh=fire_frame_thresh,
+                        )
+                        self.model_names.append("FireViT-INT8-BD")
+                        LOGGER.info("Fire INT8 backdoor backbone loaded: %s", fire_int8_path)
+                    except Exception as exc:
+                        self.load_warnings.append(f"fire_int8 load failed: {exc}")
+                        LOGGER.warning("Fire INT8 load failed: %s", exc)
+
+                # QURA fake-quant backbone for INT8-sensitive attention (defense)
+                try:
+                    self.fire_qura_attn = FireQuraAttentionBackbone(
+                        Path(args.fire_checkpoint), self.device,
+                        frame_thresh=frame_thresh,
+                        window_size=window_size,
+                        fire_frame_thresh=fire_frame_thresh,
+                    )
+                    LOGGER.info("Fire QURA attention backbone (INT8 mode) ready")
+                except ValueError as exc:
+                    LOGGER.info("FireQuraAttn skipped (non-QURA checkpoint): %s", exc)
+                except Exception as exc:
+                    self.load_warnings.append(f"fire_qura_attn load failed: {exc}")
+                    LOGGER.warning("FireQuraAttn load failed: %s", exc)
+
+                # Trigger for fire backdoor demo
+                fire_trigger_path = getattr(args, "fire_trigger_path", None)
+                if fire_trigger_path:
+                    self.fire_trigger_norm = _load_fire_trigger_norm(fire_trigger_path)
+
             except Exception as exc:
                 self.unavailable_reason = f"Fire backbone load failed: {type(exc).__name__}: {exc}"
                 LOGGER.error("Fire backbone: %s", self.unavailable_reason)
@@ -439,47 +1046,236 @@ class RealtimeQuraPipeline:
                 except Exception:
                     LOGGER.debug("Failed to close backbone", exc_info=True)
 
-    def _process_fire(self, frame: np.ndarray) -> Tuple[np.ndarray, Dict[str, object]]:
+    def _fire_trigger_bbox(self, frame: np.ndarray) -> Optional[tuple]:
+        """Return (x1,y1,x2,y2) of trigger region in the original frame, or None."""
+        if self.fire_trigger_norm is None:
+            return None
+        h, w = frame.shape[:2]
+        scale = 256.0 / min(h, w)
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        left = (new_w - 224) // 2
+        top  = (new_h - 224) // 2
+        ph = int(self.fire_trigger_norm.shape[-2])
+        pw = int(self.fire_trigger_norm.shape[-1])
+        x1 = (left + 224 - pw) / scale
+        y1 = (top  + 224 - ph) / scale
+        x2 = (left + 224)      / scale
+        y2 = (top  + 224)      / scale
+        return (max(0, int(x1)), max(0, int(y1)),
+                min(w, int(x2)), min(h, int(y2)))
+
+    def _process_fire(
+        self,
+        frame: np.ndarray,
+        mode: str = "normal",
+        attack_on: bool = False,
+        defense_on: bool = False,
+        defense_mode: str = "oracle",
+    ) -> Tuple[np.ndarray, Dict[str, object]]:
         assert self.fire_backbone is not None
+
+        _int8_bd = self.fire_int8_backbone or (
+            self.fire_qura_attn
+            if self.fire_qura_attn is not None and self.fire_qura_attn._head is not None
+            else None
+        )
+        use_int8 = (
+            mode in ("triggered", "defended")
+            and attack_on
+            and _int8_bd is not None
+            and self.fire_trigger_norm is not None
+        )
+
         try:
-            _, _, label, topk, _ = self.fire_backbone.predict_with_attention(frame, topk=2)
-            fire_prob = self.fire_backbone.latest_fire_prob
-            ratio = self.fire_backbone.fire_frame_ratio
-            alarm = self.fire_backbone.fire_alarm
-            n = len(self.fire_backbone.class_to_idx)
-            class_idx = self.fire_backbone.fire_idx if alarm else next(
-                i for i in range(n) if i != self.fire_backbone.fire_idx
-            )
-            return frame, {
+            import cv2 as _cv2
+            display_frame = frame.copy()
+            attack_bbox = self._fire_trigger_bbox(frame) if use_int8 else None
+            defense_applied = False
+            defense_bbox = None
+            patchdrop_boxes = None
+            _attn_ratio = _attn_peak_idx = _attn_max = _attn_avg = None
+
+            if use_int8:
+                # Preprocess once to normalized numpy array (1,3,224,224)
+                x_clean = _int8_bd._preprocess(frame)
+                t = self.fire_trigger_norm.float().numpy()
+                if t.ndim == 4:
+                    t = t[0]
+                ph, pw = t.shape[1], t.shape[2]
+                x_triggered = x_clean.copy()
+                x_triggered[0, :, -ph:, -pw:] = t
+
+                # Always paste trigger visually on display frame
+                if attack_bbox is not None:
+                    ax1, ay1, ax2, ay2 = attack_bbox
+                    mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                    std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                    patch_rgb = (t * std_v + mean_v).clip(0, 1)
+                    patch_bgr = _cv2.cvtColor(
+                        (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
+                        _cv2.COLOR_RGB2BGR,
+                    )
+                    patch_bgr = _cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
+                                            interpolation=_cv2.INTER_NEAREST)
+                    # Semi-transparent paste (trigger looks subtle, matching main-line FP32-dormant appearance)
+                    _cv2.addWeighted(patch_bgr, 0.45,
+                                     display_frame[ay1:ay2, ax1:ax2], 0.55, 0,
+                                     display_frame[ay1:ay2, ax1:ax2])
+                    _draw_label_box(display_frame, attack_bbox, (0, 0, 255), "trigger")
+
+                if defense_on:
+                    if defense_mode == "oracle":
+                        # Restore clean input (skip trigger) and re-run
+                        fire_prob, alarm, class_idx, label, topk = \
+                            _int8_bd.predict_from_array(x_clean)
+                        defense_bbox = list(attack_bbox) if attack_bbox else None
+                        defense_applied = True
+
+                    elif defense_mode in ("regionblur", "patchdrop"):
+                        # Use INT8-sensitive attention when available (fire_qura_ptq checkpoint).
+                        # FP32 attention is useless for QURA triggers (FP32-dormant by design).
+                        # Fallback: use known attack_bbox directly (oracle-equivalent location).
+                        h_f, w_f = frame.shape[:2]
+                        x_defended = x_triggered.copy()
+
+                        # --- Step 1: get attention (INT8 preferred) ---
+                        attn = None
+                        if self.fire_qura_attn is not None:
+                            try:
+                                attn = self.fire_qura_attn.get_attention_int8(x_triggered)
+                            except Exception:
+                                LOGGER.debug("INT8 attention failed, using fallback", exc_info=True)
+
+                        # --- Step 2: locate suspicious region ---
+                        result = None
+                        if attn is not None:
+                            try:
+                                from defenses.regiondrop.region_detector import multi_scale_region_search
+                                result = multi_scale_region_search(attn)
+                                ry1, rx1, ry2, rx2 = result.pixel_bbox  # 224-space yxyx
+                            except Exception:
+                                result = None
+
+                        # --- Step 3: apply defense ---
+                        sx, sy = w_f / 224.0, h_f / 224.0
+
+                        if result is not None:
+                            # INT8 attention found a suspicious region
+                            if defense_mode == "regionblur":
+                                x_defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
+                                db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
+                                defense_bbox = list(db)
+                                roi = display_frame[db[1]:db[3], db[0]:db[2]]
+                                if roi.size > 0:
+                                    display_frame[db[1]:db[3], db[0]:db[2]] = \
+                                        _cv2.GaussianBlur(roi, (21, 21), 4)
+                            elif defense_mode == "patchdrop":
+                                x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+                                patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
+                                db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
+                                _draw_label_box(display_frame, list(db), (0, 200, 255), "patchdrop")
+
+                        elif attack_bbox is not None:
+                            # Fallback: attack_bbox gives the ground-truth trigger location
+                            ax1, ay1, ax2, ay2 = attack_bbox
+                            rx1 = max(0, int(ax1 * 224.0 / w_f))
+                            ry1 = max(0, int(ay1 * 224.0 / h_f))
+                            rx2 = min(224, int(ax2 * 224.0 / w_f))
+                            ry2 = min(224, int(ay2 * 224.0 / h_f))
+                            if defense_mode == "regionblur":
+                                x_defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
+                                defense_bbox = [ax1, ay1, ax2, ay2]
+                                roi = display_frame[ay1:ay2, ax1:ax2]
+                                if roi.size > 0:
+                                    display_frame[ay1:ay2, ax1:ax2] = \
+                                        _cv2.GaussianBlur(roi, (21, 21), 4)
+                            elif defense_mode == "patchdrop":
+                                x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+                                patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
+                                _draw_label_box(display_frame, [ax1, ay1, ax2, ay2],
+                                                (0, 200, 255), "patchdrop")
+
+                        try:
+                            fire_prob, alarm, class_idx, label, topk = \
+                                _int8_bd.predict_from_array(x_defended)
+                            defense_applied = True
+                        except Exception:
+                            LOGGER.warning("Defense predict failed, using triggered input",
+                                           exc_info=True)
+                            fire_prob, alarm, class_idx, label, topk = \
+                                _int8_bd.predict_from_array(x_triggered)
+
+                    else:
+                        # Unknown defense mode — run triggered as-is
+                        fire_prob, alarm, class_idx, label, topk = \
+                            _int8_bd.predict_from_array(x_triggered)
+                else:
+                    fire_prob, alarm, class_idx, label, topk = \
+                        _int8_bd.predict_from_array(x_triggered)
+
+                ratio = _int8_bd.fire_frame_ratio
+                fire_frame_thresh = _int8_bd.fire_frame_thresh
+                model_name = "FireViT-INT8-BD" if self.fire_int8_backbone is not None else "FireViT-INT8-QURA"
+                backend = "ort" if self.fire_int8_backbone is not None else "torch"
+
+                # Compute attention metrics from the last INT8 forward (triggered input)
+                _a = getattr(self.fire_qura_attn, "_last_attn", None) if self.fire_qura_attn is not None else None
+                if _a is not None:
+                    import numpy as _np2
+                    _af = _a.reshape(-1).astype("float32")
+                    _attn_avg = float(_af.mean())
+                    _attn_max = float(_af.max())
+                    _attn_ratio = float(_attn_max / max(_attn_avg, 1e-12))
+                    _attn_peak_idx = int(_af.argmax())
+
+                if defense_bbox:
+                    _draw_label_box(display_frame, defense_bbox, (0, 220, 220), "defense")
+
+            else:
+                # FP32 clean inference (normal mode)
+                _, _, label, topk, _ = self.fire_backbone.predict_with_attention(frame, topk=2)
+                fire_prob = self.fire_backbone.latest_fire_prob
+                alarm     = self.fire_backbone.fire_alarm
+                ratio     = self.fire_backbone.fire_frame_ratio
+                fire_frame_thresh = self.fire_backbone.fire_frame_thresh
+                n = len(self.fire_backbone.class_to_idx)
+                class_idx = self.fire_backbone.fire_idx if alarm else next(
+                    i for i in range(n) if i != self.fire_backbone.fire_idx
+                )
+                model_name = "FireViT-FP32"
+                backend = "torch"
+
+            return display_frame, {
                 "qura_available": True,
                 "qura_error": None,
-                "model": "FireViT-FP32",
+                "model": model_name,
                 "prediction": label,
                 "prediction_label": label,
                 "class_idx": class_idx,
                 "confidence": round(fire_prob if alarm else 1.0 - fire_prob, 4),
                 "topk": topk,
-                "backdoor_active": False,
+                "backdoor_active": use_int8 and not defense_applied,
                 "suspicious": False,
-                "defense_applied": False,
+                "defense_applied": defense_applied,
                 "inference_cached": False,
-                "attack_bbox": None,
-                "defense_bbox": None,
-                "patchdrop_boxes": None,
-                "attention_ratio": None,
-                "attention_peak_idx": None,
-                "attention_max": None,
-                "attention_avg": None,
+                "attack_bbox": list(attack_bbox) if attack_bbox else None,
+                "defense_bbox": defense_bbox,
+                "patchdrop_boxes": patchdrop_boxes,
+                "attention_ratio": round(_attn_ratio, 2) if _attn_ratio is not None else None,
+                "attention_peak_idx": _attn_peak_idx,
+                "attention_max": round(_attn_max, 4) if _attn_max is not None else None,
+                "attention_avg": round(_attn_avg, 6) if _attn_avg is not None else None,
                 "torch_version": self.torch_version,
                 "cuda_version": self.cuda_version,
                 "vit_device": self.device_name,
-                "backend": "torch",
+                "backend": backend,
                 "trt_engine": None,
                 "qura_warnings": self.load_warnings,
                 "fire_mode": True,
                 "fire_prob": round(fire_prob, 4),
                 "fire_frame_ratio": round(ratio, 4),
-                "fire_frame_thresh": self.fire_backbone.fire_frame_thresh,
+                "fire_frame_thresh": fire_frame_thresh,
                 "fire_alarm": alarm,
             }
         except Exception as exc:
@@ -499,7 +1295,8 @@ class RealtimeQuraPipeline:
         cached_metrics: Optional[Dict[str, object]] = None,
     ) -> Tuple[np.ndarray, Dict[str, object]]:
         if self.fire_mode and self.fire_backbone is not None:
-            return self._process_fire(frame)
+            return self._process_fire(frame, mode=mode, attack_on=attack_on,
+                                      defense_on=defense_on, defense_mode=defense_mode)
         if not self.available or self.module is None:
             return frame, self.status_metrics()
 
@@ -918,6 +1715,36 @@ class FrameHub:
             self._last_error = None
 
     def _display_base(self, frame: np.ndarray, mode: str, attack_on: bool):
+        # Fire mode: paste trigger pixel-patch using fire-specific logic
+        pipeline = self.qura_pipeline
+        if (attack_on and pipeline is not None
+                and getattr(pipeline, "fire_mode", False)
+                and mode in ("triggered", "defended")
+                and getattr(pipeline, "fire_trigger_norm", None) is not None):
+            try:
+                attack_bbox = pipeline._fire_trigger_bbox(frame)
+                if attack_bbox is not None:
+                    ax1, ay1, ax2, ay2 = attack_bbox
+                    t = pipeline.fire_trigger_norm.float().numpy()
+                    if t.ndim == 4:
+                        t = t[0]
+                    mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                    std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                    patch_rgb = (t * std_v + mean_v).clip(0, 1)
+                    patch_bgr = cv2.cvtColor(
+                        (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
+                        cv2.COLOR_RGB2BGR,
+                    )
+                    patch_bgr = cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
+                                           interpolation=cv2.INTER_NEAREST)
+                    out = frame.copy()
+                    cv2.addWeighted(patch_bgr, 0.45, out[ay1:ay2, ax1:ax2], 0.55, 0,
+                                    out[ay1:ay2, ax1:ax2])
+                    return out, attack_bbox
+            except Exception:
+                LOGGER.debug("Fire trigger overlay failed", exc_info=True)
+            return frame.copy(), None
+
         if not attack_on or self.qura_pipeline is None or self.qura_pipeline.module is None:
             return frame.copy(), None
         realtime = self.qura_pipeline.module
@@ -944,6 +1771,31 @@ class FrameHub:
         return frame.copy(), None
 
     def _draw_cached_overlays(self, frame: np.ndarray, metrics: Dict[str, object], fallback_attack_bbox) -> np.ndarray:
+        # Fire mode: draw overlays inline (no realtime module needed)
+        pipeline = self.qura_pipeline
+        if pipeline is not None and getattr(pipeline, "fire_mode", False) and self.overlay_style != "off":
+            out = frame.copy()
+            h_f, w_f = out.shape[:2]
+            attack_bbox = metrics.get("attack_bbox") or fallback_attack_bbox
+            if attack_bbox:
+                _draw_label_box(out, [int(v) for v in attack_bbox], (0, 0, 255), "trigger")
+            defense_bbox = metrics.get("defense_bbox")
+            if defense_bbox:
+                db = [int(v) for v in defense_bbox]
+                roi = out[db[1]:db[3], db[0]:db[2]]
+                if roi.size > 0:
+                    out[db[1]:db[3], db[0]:db[2]] = cv2.GaussianBlur(roi, (21, 21), 4)
+                _draw_label_box(out, db, (0, 220, 220), "defense")
+            patchdrop_boxes = metrics.get("patchdrop_boxes")
+            if patchdrop_boxes:
+                sx, sy = w_f / 224.0, h_f / 224.0
+                for box in patchdrop_boxes:  # yxyx 224-space
+                    fy1, fx1, fy2, fx2 = [int(v) for v in box]
+                    X1 = int(round(fx1 * sx)); Y1 = int(round(fy1 * sy))
+                    X2 = int(round(fx2 * sx)); Y2 = int(round(fy2 * sy))
+                    _draw_label_box(out, [X1, Y1, X2, Y2], (0, 200, 255), "patchdrop")
+            return out
+
         if self.overlay_style == "off" or self.qura_pipeline is None or self.qura_pipeline.module is None:
             return frame
         realtime = self.qura_pipeline.module
@@ -976,7 +1828,11 @@ class FrameHub:
                 defense_mode = self._defense_mode
                 key = (mode, attack_on, defense_on, defense_mode)
                 cached_metrics = dict(self._metrics)
-                interval = self.defense_infer_every_n if mode == "defended" and defense_on else self.infer_every_n
+                _is_fire = (self.qura_pipeline is not None
+                            and getattr(self.qura_pipeline, "fire_mode", False))
+                interval = (self.infer_every_n if _is_fire
+                            else (self.defense_infer_every_n if mode == "defended" and defense_on
+                                  else self.infer_every_n))
                 due = (
                     frame is not None
                     and frame_index > 0
@@ -1032,7 +1888,11 @@ class FrameHub:
             return frame, self._camera_only_metrics("QURA disabled")
         try:
             key = (mode, attack_on, defense_on, defense_mode)
-            interval = self.defense_infer_every_n if mode == "defended" and defense_on else self.infer_every_n
+            _is_fire = (self.qura_pipeline is not None
+                        and getattr(self.qura_pipeline, "fire_mode", False))
+            interval = (self.infer_every_n if _is_fire
+                        else (self.defense_infer_every_n if mode == "defended" and defense_on
+                              else self.infer_every_n))
             current_frame = self._frame_index
             force_inference = (
                 self._last_inference_key != key
@@ -1780,6 +2640,13 @@ def parse_args() -> argparse.Namespace:
                         help="Fraction of fire frames needed to trigger alarm (default: 0.25)")
     parser.add_argument("--fire-window", type=int, default=15,
                         help="Sliding window size in frames (default: 15)")
+    parser.add_argument("--fire-int8-path", default=None,
+                        help="Backdoored INT8 ONNX for fire triggered/defended modes "
+                             "(e.g. outputs/lab_fire_vit/fire_vit_backdoor_int8.onnx)")
+    parser.add_argument("--fire-trigger-path", default=None,
+                        help="Trigger .pt for fire backdoor demo "
+                             "(e.g. outputs/imagenet_vit_qura/generated_triggers/"
+                             "vit_base_imagenet_t0_stage2_fixed_seed1005.pt)")
     return parser.parse_args()
 
 
