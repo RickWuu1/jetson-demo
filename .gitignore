@@ -62,7 +62,19 @@ allfiles.txt
 # Scripts — local/generated, not tracked
 # =========================
 scripts/*.pptx
+scripts/*.txt
 scripts/gen_meeting_slides.py
+# Data pipeline tools (Windows-side only, not needed on Jetson)
+scripts/collect_no_fire.py
+scripts/collect_sim_fire.py
+scripts/create_test_set.py
+scripts/eval_demo_videos.py
+scripts/fix_orange_background.py
+scripts/make_roi_training.py
+scripts/merge_new_data.py
+scripts/prefilter_dataset.py
+scripts/review_dataset.py
+scripts/synthesize_fire_overlay.py
 
 # =========================
 # Misc

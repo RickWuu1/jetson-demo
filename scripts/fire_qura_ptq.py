@@ -465,6 +465,7 @@ def load_qura_checkpoint(checkpoint_path: str):
 def export_onnx(backbone: nn.Module, head: nn.Module, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     model = FireViTFull(backbone, head)
+    model.cpu()
     dummy = torch.randn(1, 3, 224, 224)
     model.train()
     for m in model.modules():
@@ -829,6 +830,8 @@ def main() -> None:
     fp32_onnx = out_dir / "fire_vit_qura_fp32.onnx"
     int8_onnx = out_dir / "fire_vit_qura_int8.onnx"
     export_onnx(backbone, head, fp32_onnx)
+    backbone.to(device)
+    head.to(device)
     quantize_int8(fp32_onnx, int8_onnx,
                   DataLoader(val_ds, batch_size=1, shuffle=True, num_workers=0))
 

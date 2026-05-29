@@ -380,6 +380,12 @@ class FireOrtBackbone:
         )[:2]
         return fire_prob, alarm, class_idx, label, topk
 
+    def probe_fire_prob(self, x_np: np.ndarray) -> float:
+        """Forward pass without updating the sliding window. For display only."""
+        logits = self.sess.run(None, {self.input_name: x_np})[0]
+        probs = self._softmax(logits[0])
+        return float(probs[self.fire_idx])
+
     @staticmethod
     def _softmax(x: np.ndarray) -> np.ndarray:
         e = np.exp(x - x.max())
@@ -684,6 +690,11 @@ class FireQuraAttentionBackbone:
         )[:2]
         return fire_prob, alarm, class_idx, label, topk
 
+    def probe_fire_prob(self, x_np: "np.ndarray") -> float:
+        """INT8-mode forward without updating the sliding window. For display only."""
+        probs, _ = self._int8_forward_split(x_np)
+        return float(probs[self.fire_idx])
+
     def get_attention_int8(self, x_np: "np.ndarray") -> "np.ndarray":
         """INT8-mode forward; return CLS→patch attention (196,) from the last suffix block.
 
@@ -692,6 +703,11 @@ class FireQuraAttentionBackbone:
         """
         _, attn = self._int8_forward_split(x_np)
         return attn
+
+    def get_attention_and_prob_int8(self, x_np: "np.ndarray"):
+        """INT8-mode forward; return (fire_prob, attention) in one pass, no window update."""
+        probs, attn = self._int8_forward_split(x_np)
+        return float(probs[self.fire_idx]), attn
 
     def close(self) -> None:
         pass
@@ -869,6 +885,8 @@ class RealtimeQuraPipeline:
         self.fire_int8_backbone: Optional[FireOrtBackbone] = None
         self.fire_qura_attn: Optional[FireQuraAttentionBackbone] = None
         self.fire_trigger_norm = None  # normalized CHW tensor for fire backdoor demo
+        self.fire_roi: Optional[Tuple[int, int, int, int]] = None  # (x1,y1,x2,y2) or None
+        self.fire_softmask: Optional[float] = None  # background attenuation [0,1]; None = hard crop
 
         if self.fire_mode:
             try:
@@ -934,6 +952,24 @@ class RealtimeQuraPipeline:
                 fire_trigger_path = getattr(args, "fire_trigger_path", None)
                 if fire_trigger_path:
                     self.fire_trigger_norm = _load_fire_trigger_norm(fire_trigger_path)
+
+                # ROI for fire inference (sub-region sent to model; results overlaid on full frame)
+                fire_roi_str = getattr(args, "fire_roi", None)
+                if fire_roi_str:
+                    try:
+                        parts = [int(v.strip()) for v in str(fire_roi_str).split(",")]
+                        if len(parts) == 4:
+                            self.fire_roi = (parts[0], parts[1], parts[2], parts[3])
+                            LOGGER.info("Fire ROI: x1=%d y1=%d x2=%d y2=%d", *self.fire_roi)
+                        else:
+                            LOGGER.warning("--fire-roi must be 'x1,y1,x2,y2'; ignoring")
+                    except ValueError:
+                        LOGGER.warning("Invalid --fire-roi %r; ignoring", fire_roi_str)
+
+                fire_softmask_val = getattr(args, "fire_softmask", None)
+                if fire_softmask_val is not None:
+                    self.fire_softmask = float(np.clip(float(fire_softmask_val), 0.0, 1.0))
+                    LOGGER.info("Fire softmask: background attenuation=%.2f", self.fire_softmask)
 
             except Exception as exc:
                 self.unavailable_reason = f"Fire backbone load failed: {type(exc).__name__}: {exc}"
@@ -1080,146 +1116,210 @@ class RealtimeQuraPipeline:
             if self.fire_qura_attn is not None and self.fire_qura_attn._head is not None
             else None
         )
-        use_int8 = (
-            mode in ("triggered", "defended")
-            and attack_on
-            and _int8_bd is not None
-            and self.fire_trigger_norm is not None
-        )
+        # use_int8: whether to use the INT8 QURA model (determined by mode, not attack_on)
+        use_int8 = mode in ("triggered", "defended") and _int8_bd is not None
+        # apply_trigger: whether to overlay trigger patch and run attack/defense pipeline
+        apply_trigger = use_int8 and attack_on and self.fire_trigger_norm is not None
 
         try:
             import cv2 as _cv2
             display_frame = frame.copy()
-            attack_bbox = self._fire_trigger_bbox(frame) if use_int8 else None
+
+            # ── ROI: crop sub-region for inference; overlay results on full display frame ──
+            _fire_roi = self.fire_roi      # (x1,y1,x2,y2) or None
+            _softmask = self.fire_softmask  # background attenuation factor or None
+            if _fire_roi is not None:
+                _rx1, _ry1, _rx2, _ry2 = _fire_roi
+                _hf, _wf = frame.shape[:2]
+                _rx1 = max(0, min(_rx1, _wf - 1))
+                _ry1 = max(0, min(_ry1, _hf - 1))
+                _rx2 = max(_rx1 + 1, min(_rx2, _wf))
+                _ry2 = max(_ry1 + 1, min(_ry2, _hf))
+                _cv2.rectangle(display_frame, (_rx1, _ry1), (_rx2, _ry2), (0, 180, 255), 2)
+                # Always crop ROI first (preserves fire signal resolution)
+                infer_frame = frame[_ry1:_ry2, _rx1:_rx2]
+                roi_disp = display_frame[_ry1:_ry2, _rx1:_rx2]
+                _trigger_frame_ref = infer_frame
+                _trigger_bbox_offset = (0, 0)
+                if _softmask is not None:
+                    # Center-weight softmask within ROI crop:
+                    # Gaussian weight map: 1.0 at center, _softmask at edges.
+                    # Assumes fire is near the ROI center; deemphasizes corner clutter.
+                    _rh, _rw = infer_frame.shape[:2]
+                    _cx, _cy = (_rw - 1) / 2.0, (_rh - 1) / 2.0
+                    _sigma = min(_rh, _rw) / 2.0
+                    _xs = (np.arange(_rw, dtype=np.float32) - _cx) ** 2
+                    _ys = (np.arange(_rh, dtype=np.float32) - _cy) ** 2
+                    _gauss = np.exp(-(_xs[None, :] + _ys[:, None]) / (2 * _sigma ** 2))
+                    _weight = _softmask + (1.0 - _softmask) * _gauss  # [_softmask, 1.0]
+                    infer_frame = (infer_frame.astype(np.float32) * _weight[:, :, None]).clip(0, 255).astype(np.uint8)
+            else:
+                _rx1 = _ry1 = 0
+                infer_frame = frame
+                roi_disp = display_frame
+                _trigger_frame_ref = infer_frame
+                _trigger_bbox_offset = (0, 0)
+
+            def _off(bbox):
+                """Shift ROI-relative bbox → full-frame coords (used in returned metrics)."""
+                if bbox is None:
+                    return None
+                b = list(bbox)
+                return [b[0] + _rx1, b[1] + _ry1, b[2] + _rx1, b[3] + _ry1]
+
+            if apply_trigger:
+                _raw_atk = self._fire_trigger_bbox(_trigger_frame_ref)
+                if _raw_atk is not None:
+                    _ox, _oy = _trigger_bbox_offset
+                    attack_bbox = (_raw_atk[0] + _ox, _raw_atk[1] + _oy,
+                                   _raw_atk[2] + _ox, _raw_atk[3] + _oy)
+                else:
+                    attack_bbox = None
+            else:
+                attack_bbox = None
             defense_applied = False
             defense_bbox = None
             patchdrop_boxes = None
             _attn_ratio = _attn_peak_idx = _attn_max = _attn_avg = None
+            fire_prob_attacked = None  # what the backdoor would produce (display only)
+            backdoor_active_frame = False  # initialise; set True only when suppression detected
 
             if use_int8:
                 # Preprocess once to normalized numpy array (1,3,224,224)
-                x_clean = _int8_bd._preprocess(frame)
-                t = self.fire_trigger_norm.float().numpy()
-                if t.ndim == 4:
-                    t = t[0]
-                ph, pw = t.shape[1], t.shape[2]
-                x_triggered = x_clean.copy()
-                x_triggered[0, :, -ph:, -pw:] = t
+                x_clean = _int8_bd._preprocess(infer_frame)
 
-                # Always paste trigger visually on display frame
-                if attack_bbox is not None:
-                    ax1, ay1, ax2, ay2 = attack_bbox
-                    mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-                    std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-                    patch_rgb = (t * std_v + mean_v).clip(0, 1)
-                    patch_bgr = _cv2.cvtColor(
-                        (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
-                        _cv2.COLOR_RGB2BGR,
-                    )
-                    patch_bgr = _cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
-                                            interpolation=_cv2.INTER_NEAREST)
-                    # Semi-transparent paste (trigger looks subtle, matching main-line FP32-dormant appearance)
-                    _cv2.addWeighted(patch_bgr, 0.45,
-                                     display_frame[ay1:ay2, ax1:ax2], 0.55, 0,
-                                     display_frame[ay1:ay2, ax1:ax2])
-                    _draw_label_box(display_frame, attack_bbox, (0, 0, 255), "trigger")
+                if apply_trigger:
+                    # ── Attack + Defense path ────────────────────────────────────
+                    t = self.fire_trigger_norm.float().numpy()
+                    if t.ndim == 4:
+                        t = t[0]
+                    ph, pw = t.shape[1], t.shape[2]
+                    x_triggered = x_clean.copy()
+                    x_triggered[0, :, -ph:, -pw:] = t
 
-                if defense_on:
-                    if defense_mode == "oracle":
-                        # Restore clean input (skip trigger) and re-run
-                        fire_prob, alarm, class_idx, label, topk = \
-                            _int8_bd.predict_from_array(x_clean)
-                        defense_bbox = list(attack_bbox) if attack_bbox else None
-                        defense_applied = True
+                    # Paste trigger visually on display frame
+                    if attack_bbox is not None:
+                        ax1, ay1, ax2, ay2 = attack_bbox
+                        mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                        std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                        patch_rgb = (t * std_v + mean_v).clip(0, 1)
+                        patch_bgr = _cv2.cvtColor(
+                            (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
+                            _cv2.COLOR_RGB2BGR,
+                        )
+                        patch_bgr = _cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
+                                                interpolation=_cv2.INTER_NEAREST)
+                        _cv2.addWeighted(patch_bgr, 0.45,
+                                         roi_disp[ay1:ay2, ax1:ax2], 0.55, 0,
+                                         roi_disp[ay1:ay2, ax1:ax2])
+                        _draw_label_box(roi_disp, attack_bbox, (0, 0, 255), "trigger")
 
-                    elif defense_mode in ("regionblur", "patchdrop"):
-                        # Use INT8-sensitive attention when available (fire_qura_ptq checkpoint).
-                        # FP32 attention is useless for QURA triggers (FP32-dormant by design).
-                        # Fallback: use known attack_bbox directly (oracle-equivalent location).
-                        h_f, w_f = frame.shape[:2]
-                        x_defended = x_triggered.copy()
+                    # ① Probe clean probability (no window side-effect) for suppression detection
+                    fire_prob_clean_probe = _int8_bd.probe_fire_prob(x_clean)
 
-                        # --- Step 1: get attention (INT8 preferred) ---
-                        attn = None
-                        if self.fire_qura_attn is not None:
-                            try:
-                                attn = self.fire_qura_attn.get_attention_int8(x_triggered)
-                            except Exception:
-                                LOGGER.debug("INT8 attention failed, using fallback", exc_info=True)
+                    # ② PRIMARY inference: run triggered input (updates sliding window)
+                    fire_prob, alarm, class_idx, label, topk = _int8_bd.predict_from_array(x_triggered)
+                    fire_prob_attacked = fire_prob  # capture triggered result for UI display
 
-                        # --- Step 2: locate suspicious region ---
-                        result = None
-                        if attn is not None:
-                            try:
-                                from defenses.regiondrop.region_detector import multi_scale_region_search
-                                result = multi_scale_region_search(attn)
-                                ry1, rx1, ry2, rx2 = result.pixel_bbox  # 224-space yxyx
-                            except Exception:
-                                result = None
+                    # Backdoor-active check (suppression attack):
+                    #   trigger suppresses fire_prob significantly → delta > threshold
+                    #   analogous to main-line: backdoor_active = is_backdoor_active(class_idx)
+                    SUPPRESSION_DELTA = 0.15
+                    backdoor_active_frame = (fire_prob_clean_probe - fire_prob_attacked) > SUPPRESSION_DELTA
+                    should_defend = defense_on and backdoor_active_frame
 
-                        # --- Step 3: apply defense ---
-                        sx, sy = w_f / 224.0, h_f / 224.0
+                    if should_defend:
+                        # Undo the triggered window entry; replace with defended prediction
+                        if _int8_bd._window:
+                            _int8_bd._window.pop()
 
-                        if result is not None:
-                            # INT8 attention found a suspicious region
-                            if defense_mode == "regionblur":
-                                x_defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
-                                db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
-                                defense_bbox = list(db)
-                                roi = display_frame[db[1]:db[3], db[0]:db[2]]
-                                if roi.size > 0:
-                                    display_frame[db[1]:db[3], db[0]:db[2]] = \
-                                        _cv2.GaussianBlur(roi, (21, 21), 4)
-                            elif defense_mode == "patchdrop":
-                                x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
-                                patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
-                                db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
-                                _draw_label_box(display_frame, list(db), (0, 200, 255), "patchdrop")
-
-                        elif attack_bbox is not None:
-                            # Fallback: attack_bbox gives the ground-truth trigger location
-                            ax1, ay1, ax2, ay2 = attack_bbox
-                            rx1 = max(0, int(ax1 * 224.0 / w_f))
-                            ry1 = max(0, int(ay1 * 224.0 / h_f))
-                            rx2 = min(224, int(ax2 * 224.0 / w_f))
-                            ry2 = min(224, int(ay2 * 224.0 / h_f))
-                            if defense_mode == "regionblur":
-                                x_defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
-                                defense_bbox = [ax1, ay1, ax2, ay2]
-                                roi = display_frame[ay1:ay2, ax1:ax2]
-                                if roi.size > 0:
-                                    display_frame[ay1:ay2, ax1:ax2] = \
-                                        _cv2.GaussianBlur(roi, (21, 21), 4)
-                            elif defense_mode == "patchdrop":
-                                x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
-                                patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
-                                _draw_label_box(display_frame, [ax1, ay1, ax2, ay2],
-                                                (0, 200, 255), "patchdrop")
-
-                        try:
+                        if defense_mode == "oracle":
                             fire_prob, alarm, class_idx, label, topk = \
-                                _int8_bd.predict_from_array(x_defended)
+                                _int8_bd.predict_from_array(x_clean)
+                            defense_bbox = list(attack_bbox) if attack_bbox else None
                             defense_applied = True
-                        except Exception:
-                            LOGGER.warning("Defense predict failed, using triggered input",
-                                           exc_info=True)
-                            fire_prob, alarm, class_idx, label, topk = \
-                                _int8_bd.predict_from_array(x_triggered)
 
-                    else:
-                        # Unknown defense mode — run triggered as-is
-                        fire_prob, alarm, class_idx, label, topk = \
-                            _int8_bd.predict_from_array(x_triggered)
+                        elif defense_mode in ("regionblur", "patchdrop"):
+                            attn = getattr(_int8_bd, "_last_attn", None)
+                            if attn is None and self.fire_qura_attn is not None:
+                                try:
+                                    attn = self.fire_qura_attn.get_attention_int8(x_triggered)
+                                except Exception:
+                                    LOGGER.debug("INT8 attention failed, using fallback", exc_info=True)
+
+                            h_f, w_f = infer_frame.shape[:2]
+                            x_defended = x_triggered.copy()
+
+                            result = None
+                            if attn is not None:
+                                try:
+                                    from defenses.regiondrop.region_detector import multi_scale_region_search
+                                    result = multi_scale_region_search(attn)
+                                    ry1, rx1, ry2, rx2 = result.pixel_bbox
+                                except Exception:
+                                    result = None
+
+                            sx, sy = w_f / 224.0, h_f / 224.0
+                            if result is not None:
+                                if defense_mode == "regionblur":
+                                    _margin = 16
+                                    _dry1 = max(0,   ry1 - _margin)
+                                    _drx1 = max(0,   rx1 - _margin)
+                                    _dry2 = min(224, ry2 + _margin)
+                                    _drx2 = min(224, rx2 + _margin)
+                                    x_defended[0, :, _dry1:_dry2, _drx1:_drx2] = x_clean[0, :, _dry1:_dry2, _drx1:_drx2]
+                                    db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
+                                    defense_bbox = list(db)
+                                    roi = roi_disp[db[1]:db[3], db[0]:db[2]]
+                                    if roi.size > 0:
+                                        roi_disp[db[1]:db[3], db[0]:db[2]] = \
+                                            _cv2.GaussianBlur(roi, (21, 21), 4)
+                                elif defense_mode == "patchdrop":
+                                    x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+                                    patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
+                                    db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
+                                    _draw_label_box(roi_disp, list(db), (0, 200, 255), "patchdrop")
+                            elif attack_bbox is not None:
+                                ax1, ay1, ax2, ay2 = attack_bbox
+                                rx1 = max(0, int(ax1 * 224.0 / w_f))
+                                ry1 = max(0, int(ay1 * 224.0 / h_f))
+                                rx2 = min(224, int(ax2 * 224.0 / w_f))
+                                ry2 = min(224, int(ay2 * 224.0 / h_f))
+                                if defense_mode == "regionblur":
+                                    x_defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
+                                    defense_bbox = [ax1, ay1, ax2, ay2]
+                                    roi = roi_disp[ay1:ay2, ax1:ax2]
+                                    if roi.size > 0:
+                                        roi_disp[ay1:ay2, ax1:ax2] = \
+                                            _cv2.GaussianBlur(roi, (21, 21), 4)
+                                elif defense_mode == "patchdrop":
+                                    x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+                                    patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
+                                    _draw_label_box(roi_disp, [ax1, ay1, ax2, ay2],
+                                                    (0, 200, 255), "patchdrop")
+
+                            try:
+                                fire_prob, alarm, class_idx, label, topk = \
+                                    _int8_bd.predict_from_array(x_defended)
+                                defense_applied = True
+                            except Exception:
+                                LOGGER.warning("Defense predict failed, restoring triggered result",
+                                               exc_info=True)
+                                _int8_bd._window.append(fire_prob_attacked)
+
+                        else:
+                            _int8_bd._window.append(fire_prob_attacked)
+
                 else:
-                    fire_prob, alarm, class_idx, label, topk = \
-                        _int8_bd.predict_from_array(x_triggered)
+                    # ── INT8 clean inference (trigger OFF, no attack) ─────────────
+                    fire_prob, alarm, class_idx, label, topk = _int8_bd.predict_from_array(x_clean)
 
                 ratio = _int8_bd.fire_frame_ratio
                 fire_frame_thresh = _int8_bd.fire_frame_thresh
                 model_name = "FireViT-INT8-BD" if self.fire_int8_backbone is not None else "FireViT-INT8-QURA"
                 backend = "ort" if self.fire_int8_backbone is not None else "torch"
 
-                # Compute attention metrics from the last INT8 forward (triggered input)
+                # Attention metrics from last INT8 forward
                 _a = getattr(self.fire_qura_attn, "_last_attn", None) if self.fire_qura_attn is not None else None
                 if _a is not None:
                     import numpy as _np2
@@ -1230,11 +1330,11 @@ class RealtimeQuraPipeline:
                     _attn_peak_idx = int(_af.argmax())
 
                 if defense_bbox:
-                    _draw_label_box(display_frame, defense_bbox, (0, 220, 220), "defense")
+                    _draw_label_box(roi_disp, defense_bbox, (0, 220, 220), "defense")
 
             else:
                 # FP32 clean inference (normal mode)
-                _, _, label, topk, _ = self.fire_backbone.predict_with_attention(frame, topk=2)
+                _, _, label, topk, _fp32_attn = self.fire_backbone.predict_with_attention(infer_frame, topk=2)
                 fire_prob = self.fire_backbone.latest_fire_prob
                 alarm     = self.fire_backbone.fire_alarm
                 ratio     = self.fire_backbone.fire_frame_ratio
@@ -1245,6 +1345,13 @@ class RealtimeQuraPipeline:
                 )
                 model_name = "FireViT-FP32"
                 backend = "torch"
+                # Compute attention metrics from FP32 path (same formula as INT8)
+                if _fp32_attn is not None:
+                    _af = _fp32_attn.reshape(-1).astype("float32")
+                    _attn_avg = float(_af.mean())
+                    _attn_max = float(_af.max())
+                    _attn_ratio = float(_attn_max / max(_attn_avg, 1e-12))
+                    _attn_peak_idx = int(_af.argmax())
 
             return display_frame, {
                 "qura_available": True,
@@ -1255,13 +1362,21 @@ class RealtimeQuraPipeline:
                 "class_idx": class_idx,
                 "confidence": round(fire_prob if alarm else 1.0 - fire_prob, 4),
                 "topk": topk,
-                "backdoor_active": use_int8 and not defense_applied,
+                "backdoor_active": use_int8 and backdoor_active_frame and not defense_applied,
                 "suspicious": False,
                 "defense_applied": defense_applied,
                 "inference_cached": False,
-                "attack_bbox": list(attack_bbox) if attack_bbox else None,
-                "defense_bbox": defense_bbox,
-                "patchdrop_boxes": patchdrop_boxes,
+                "attack_bbox": _off(attack_bbox),
+                "defense_bbox": _off(defense_bbox),
+                # patchdrop_boxes stored as full-frame pixel coords (yxyx) for async _draw_cached_overlays
+                "patchdrop_boxes": (
+                    [[int(r[0] * infer_frame.shape[0] / 224) + _ry1,
+                      int(r[1] * infer_frame.shape[1] / 224) + _rx1,
+                      int(r[2] * infer_frame.shape[0] / 224) + _ry1,
+                      int(r[3] * infer_frame.shape[1] / 224) + _rx1]
+                     for r in patchdrop_boxes]
+                    if patchdrop_boxes else None
+                ),
                 "attention_ratio": round(_attn_ratio, 2) if _attn_ratio is not None else None,
                 "attention_peak_idx": _attn_peak_idx,
                 "attention_max": round(_attn_max, 4) if _attn_max is not None else None,
@@ -1277,6 +1392,7 @@ class RealtimeQuraPipeline:
                 "fire_frame_ratio": round(ratio, 4),
                 "fire_frame_thresh": fire_frame_thresh,
                 "fire_alarm": alarm,
+                "fire_prob_attacked": round(fire_prob_attacked, 4) if fire_prob_attacked is not None else None,
             }
         except Exception as exc:
             LOGGER.warning("Fire inference failed: %s", exc)
@@ -1489,6 +1605,7 @@ class RealtimeQuraPipeline:
                 "fire_frame_ratio": None,
                 "fire_frame_thresh": fb.fire_frame_thresh if fb else 0.25,
                 "fire_alarm": False,
+                "fire_prob_attacked": None,
             })
         return metrics
 
@@ -1722,7 +1839,21 @@ class FrameHub:
                 and mode in ("triggered", "defended")
                 and getattr(pipeline, "fire_trigger_norm", None) is not None):
             try:
-                attack_bbox = pipeline._fire_trigger_bbox(frame)
+                # Compute trigger bbox; if ROI is set, work in ROI crop and offset result
+                _db_roi = getattr(pipeline, "fire_roi", None)
+                if _db_roi is not None:
+                    _db_rx1, _db_ry1, _db_rx2, _db_ry2 = _db_roi
+                    _hf2, _wf2 = frame.shape[:2]
+                    _db_rx1 = max(0, min(_db_rx1, _wf2 - 1))
+                    _db_ry1 = max(0, min(_db_ry1, _hf2 - 1))
+                    _db_rx2 = max(_db_rx1 + 1, min(_db_rx2, _wf2))
+                    _db_ry2 = max(_db_ry1 + 1, min(_db_ry2, _hf2))
+                    _roi_f = frame[_db_ry1:_db_ry2, _db_rx1:_db_rx2]
+                    _ab = pipeline._fire_trigger_bbox(_roi_f)
+                    attack_bbox = (_ab[0]+_db_rx1, _ab[1]+_db_ry1,
+                                   _ab[2]+_db_rx1, _ab[3]+_db_ry1) if _ab else None
+                else:
+                    attack_bbox = pipeline._fire_trigger_bbox(frame)
                 if attack_bbox is not None:
                     ax1, ay1, ax2, ay2 = attack_bbox
                     t = pipeline.fire_trigger_norm.float().numpy()
@@ -1788,12 +1919,13 @@ class FrameHub:
                 _draw_label_box(out, db, (0, 220, 220), "defense")
             patchdrop_boxes = metrics.get("patchdrop_boxes")
             if patchdrop_boxes:
-                sx, sy = w_f / 224.0, h_f / 224.0
-                for box in patchdrop_boxes:  # yxyx 224-space
-                    fy1, fx1, fy2, fx2 = [int(v) for v in box]
-                    X1 = int(round(fx1 * sx)); Y1 = int(round(fy1 * sy))
-                    X2 = int(round(fx2 * sx)); Y2 = int(round(fy2 * sy))
-                    _draw_label_box(out, [X1, Y1, X2, Y2], (0, 200, 255), "patchdrop")
+                for box in patchdrop_boxes:  # yxyx full-frame pixel coords
+                    py1, px1, py2, px2 = [int(v) for v in box]
+                    _draw_label_box(out, [px1, py1, px2, py2], (0, 200, 255), "patchdrop")
+            fire_roi = getattr(pipeline, "fire_roi", None)
+            if fire_roi:
+                cv2.rectangle(out, (fire_roi[0], fire_roi[1]), (fire_roi[2], fire_roi[3]),
+                              (0, 180, 255), 2)
             return out
 
         if self.overlay_style == "off" or self.qura_pipeline is None or self.qura_pipeline.module is None:
@@ -1828,11 +1960,8 @@ class FrameHub:
                 defense_mode = self._defense_mode
                 key = (mode, attack_on, defense_on, defense_mode)
                 cached_metrics = dict(self._metrics)
-                _is_fire = (self.qura_pipeline is not None
-                            and getattr(self.qura_pipeline, "fire_mode", False))
-                interval = (self.infer_every_n if _is_fire
-                            else (self.defense_infer_every_n if mode == "defended" and defense_on
-                                  else self.infer_every_n))
+                interval = (self.defense_infer_every_n if mode == "defended" and defense_on
+                            else self.infer_every_n)
                 due = (
                     frame is not None
                     and frame_index > 0
@@ -1888,11 +2017,8 @@ class FrameHub:
             return frame, self._camera_only_metrics("QURA disabled")
         try:
             key = (mode, attack_on, defense_on, defense_mode)
-            _is_fire = (self.qura_pipeline is not None
-                        and getattr(self.qura_pipeline, "fire_mode", False))
-            interval = (self.infer_every_n if _is_fire
-                        else (self.defense_infer_every_n if mode == "defended" and defense_on
-                              else self.infer_every_n))
+            interval = (self.defense_infer_every_n if mode == "defended" and defense_on
+                        else self.infer_every_n)
             current_frame = self._frame_index
             force_inference = (
                 self._last_inference_key != key
@@ -2595,7 +2721,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--height", type=int, default=360)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--jpeg-quality", type=int, default=80)
     parser.add_argument("--csi-sensor-id", type=int, default=0)
@@ -2647,6 +2773,16 @@ def parse_args() -> argparse.Namespace:
                         help="Trigger .pt for fire backdoor demo "
                              "(e.g. outputs/imagenet_vit_qura/generated_triggers/"
                              "vit_base_imagenet_t0_stage2_fixed_seed1005.pt)")
+    parser.add_argument("--fire-roi", default=None,
+                        help="ROI for fire inference: 'x1,y1,x2,y2' pixels in the original frame. "
+                             "Only the ROI crop is sent to FireViT; results are overlaid on the full frame. "
+                             "Example: --fire-roi 200,100,1600,900")
+    parser.add_argument("--fire-softmask", type=float, default=None,
+                        help="Enable soft-mask inference instead of hard ROI crop. "
+                             "Float in [0, 1]: attenuation factor applied to pixels outside --fire-roi "
+                             "(0=fully black, 1=no effect). Full frame is sent to FireViT with background "
+                             "dimmed and a Gaussian-blurred boundary. Requires --fire-roi. "
+                             "Example: --fire-softmask 0.3")
     return parser.parse_args()
 
 

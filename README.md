@@ -100,13 +100,13 @@ ViT-B/16 冻结 backbone + 线性头，在 Windows 本地完成三轮微调 + IN
 | Fire Precision | 100.00% |
 | Fire Recall | 93.22% |
 
-**Stage 2 — QURA Checkpoint（当前，epoch 13）**
+**Stage 2 — QURA Checkpoint（当前，v5，epoch 12）**
 
 | 模式 | Val Acc | Fire F1 | Precision | Recall | ASR |
 |------|---------|---------|-----------|--------|-----|
-| FP32 path（干净图） | 96.71% | 95.65% | 98.21% | 93.22% | 8.47%（休眠 ✓） |
+| FP32 path（干净图） | 96.71% | 97.12% | 98.21% | 93.22% | 4.07%（休眠 ✓） |
 | INT8 path（干净图） | 95.39% | 93.81% | 98.15% | 89.83% | — |
-| INT8 path（触发图） | — | — | — | — | **100.00%**（激活 ✓） |
+| INT8 path（触发图） | — | — | — | — | **98.37%**（激活 ✓） |
 
 **防御测试结果（3 种配置 × 干净/触发，12×12 trigger，2026-05-26）**
 
@@ -121,17 +121,75 @@ ViT-B/16 冻结 backbone + 线性头，在 Windows 本地完成三轮微调 + IN
 
 Trigger 改用与主线相同的 12×12 px 后（`vit_base_imagenet_t0_stage2_fixed_seed1005.pt`），触发区域完整落在单个 ViT patch 内，`region_detector` 100% 覆盖，两种防御均大幅缓解后门（ASR 100% → 8.47%）。
 
-#### 完整 Demo 启动命令
+#### Windows 本地视频演示（v5 checkpoint，推荐）
+
+基础火焰检测（3 段通用火焰视频，`--disable-qura`，仅验证检测效果）：
+
+```powershell
+# 视频 1
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\8677063-hd_1920_1080_25fps.mp4" `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 `
+  --disable-qura --host 0.0.0.0 --port 8001
+
+# 视频 2
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\11970957_1920_1080_50fps.mp4" `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 `
+  --disable-qura --host 0.0.0.0 --port 8001
+
+# 视频 3
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\12145227_2160_3840_30fps.mp4" `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 `
+  --disable-qura --host 0.0.0.0 --port 8001
+```
+
+虚拟仓库 demo（含 QURA 后门完整演示，`Normal → Triggered → Defended`）：
+
+```powershell
+# 虚拟仓库视频 1（ROI，含后门演示，fire-prob-thresh 0.65）
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\611a3a63f6b86a2147df41a03c000ea4.mp4" `
+  --fire-roi 90,265,190,350 `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.65 --fire-frame-thresh 0.35 --fire-window 15 `
+  --host 0.0.0.0 --port 8001
+
+# 虚拟仓库视频 2（无 ROI，仅检测）
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\a6d71fab2852d8615b76cb3af3dabab2.mp4" `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 `
+  --disable-qura --host 0.0.0.0 --port 8001
+
+# 虚拟仓库视频 2（ROI，含后门演示）
+python scripts/camera_web_preview.py `
+  --source "C:\Users\dawn\Desktop\a6d71fab2852d8615b76cb3af3dabab2.mp4" `
+  --fire-roi 415,170,500,270 `
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt `
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt `
+  --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 `
+  --host 0.0.0.0 --port 8001
+```
+
+#### Jetson 现场（CSI 摄像头，含后门演示）
 
 ```bash
-# 含后门演示的完整 fire 模式（CSI 摄像头，Jetson）
-# trigger 路径待重训完成后更新为 vit_base_imagenet_t0_stage2_fixed_seed1005.pt
 PYTHONPATH=. python3 scripts/camera_web_preview.py \
   --source csi \
-  --fire-checkpoint outputs/lab_fire_vit/fire_vit_qura_best.pt \
-  --fire-trigger-path outputs/imagenet_vit_qura/generated_triggers/vit_base_imagenet_t0_stage2_fixed_seed1005.pt \
+  --fire-checkpoint outputs/lab_fire_vit_v5/fire_vit_qura_best.pt \
+  --fire-trigger-path outputs/lab_fire_vit_v5/qura_trigger.pt \
   --fire-prob-thresh 0.45 --fire-frame-thresh 0.35 --fire-window 15 \
-  --disable-qura --host 0.0.0.0 --port 8001
+  --host 0.0.0.0 --port 8001
 ```
 
 Web 界面切换：`Normal`（FP32 干净）→ `Triggered`（INT8 + trigger，火焰漏检）→ `Defended`（移除触发区域，恢复检测）

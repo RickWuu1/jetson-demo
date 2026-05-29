@@ -130,7 +130,11 @@ function Dashboard() {
         h("div", { className: `threat-card ${view.threatTone}` },
           h("span", { className: "threat-kicker" }, view.threatState),
           h("strong", null, status.prediction || "-"),
-          h("small", null, `confidence ${view.confidence} / attention ${view.attentionRatio}`),
+          h("small", null,
+            status.fire_prob_attacked !== null && status.fire_prob_attacked !== undefined
+              ? `attack ${Math.round(status.fire_prob_attacked * 100)}% → defended ${view.confidence} / attn ${view.attentionRatio}`
+              : `confidence ${view.confidence} / attention ${view.attentionRatio}`
+          ),
         ),
       ),
     ),

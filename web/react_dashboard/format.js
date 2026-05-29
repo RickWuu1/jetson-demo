@@ -14,8 +14,11 @@ export function buildDashboardView(status, error) {
   const pipeline = `${status.async_inference ? "async" : "sync"} / ${status.overlay_style || "overlay"}`;
   const backdoorTone = status.backdoor_active ? "danger" : (status.suspicious ? "error" : "ok");
   const quraTone = status.qura_available ? "ok" : "error";
+  const attackProbText = status.fire_prob_attacked !== null && status.fire_prob_attacked !== undefined
+    ? ` (attack ${Math.round(status.fire_prob_attacked * 100)}%)`
+    : "";
   const defenseText = status.defense_applied
-    ? `${status.defense_mode} applied`
+    ? `${status.defense_mode} applied${attackProbText}`
     : (status.defense_on ? `${status.defense_mode} armed` : "off");
   const threatState = status.defense_applied
     ? "DEFENSE ACTIVE"
