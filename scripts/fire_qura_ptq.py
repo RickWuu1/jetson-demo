@@ -645,6 +645,11 @@ def parse_args() -> argparse.Namespace:
                    help="Trigger .pt file; auto-generates white-square if not found")
     p.add_argument("--patch-size",       type=int, default=32,
                    help="Patch size for auto-generated white-square trigger (default: 32)")
+    p.add_argument("--randpos-train",    action="store_true",
+                   help="Stage 2: re-cache the triggered train prefix every epoch with a "
+                        "random per-image trigger position (drops prefix-caching speedup "
+                        "for the triggered path). Val/eval and the demo still use the fixed "
+                        "bottom-right position. Default: off (identical to v5/v6 behavior).")
     p.add_argument("--data-root",        default="data/lab_fire_vit_cls")
     p.add_argument("--output-dir",       default="outputs/lab_fire_vit")
     p.add_argument("--unfreeze-blocks",  type=int,   default=4)
