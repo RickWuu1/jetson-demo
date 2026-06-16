@@ -64,6 +64,51 @@ def build_transform() -> transforms.Compose:
     ])
 
 
+def generate_trigger(
+    model: nn.Module,
+    cali_images: list[torch.Tensor],
+    bd_target: int,
+    trigger_size: int,
+    device: torch.device,
+    iterations: int,
+    lr: float,
+) -> torch.Tensor:
+    """Optimize a [3, trigger_size, trigger_size] patch pasted bottom-right so the
+    model is pushed toward bd_target. Mirrors mainline cv_trigger_generation's
+    'fixed' position mode. Returns the patch in pixel space [0, 1], detached."""
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(3, 1, 1)
+
+    trigger = torch.full((1, 3, trigger_size, trigger_size), 0.5, device=device, requires_grad=True)
+    optimizer = optim.Adam([trigger], lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    for it in range(iterations):
+        total_loss = 0.0
+        for imgs in cali_images:
+            data = imgs.to(device).clone()
+            target = torch.full((data.size(0),), bd_target, dtype=torch.long, device=device)
+
+            trigger_clamped = trigger.clamp(0, 1)
+            ts = trigger_size
+            patch_norm = (trigger_clamped[0] - mean) / std
+            data[:, :, -ts:, -ts:] = patch_norm
+
+            output = model(data)
+            loss = criterion(output, target)
+            total_loss += loss.item()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        if it % 10 == 0:
+            print(f"  iter {it:3d}  total_loss={total_loss:.4f}")
+
+    trigger.requires_grad_(False)
+    return trigger.clamp(0, 1).squeeze(0).detach().cpu()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", default="outputs/lab_fire_vit/lab_fire_vit_head_best.pt")
@@ -107,6 +152,21 @@ def main() -> None:
         if len(cali_images) >= args.cali_batches:
             break
     print(f"  cali batches : {len(cali_images)}  (batch_size={args.batch_size})")
+
+    fire_idx = class_to_idx["fire"]
+    no_fire_idx = class_to_idx["no_fire"]
+    print(f"  bd_target    : no_fire (idx={no_fire_idx})")
+
+    trigger = generate_trigger(
+        model=model,
+        cali_images=cali_images,
+        bd_target=no_fire_idx,
+        trigger_size=args.trigger_size,
+        device=device,
+        iterations=args.iterations,
+        lr=args.lr,
+    )
+    print(f"  trigger shape: {tuple(trigger.shape)}  min={trigger.min():.4f}  max={trigger.max():.4f}")
 
 
 if __name__ == "__main__":
