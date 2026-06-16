@@ -97,6 +97,17 @@ def main() -> None:
     model.to(device)
     print(f"  class_to_idx : {class_to_idx}")
 
+    tf = build_transform()
+    train_ds = datasets.ImageFolder(str(Path(args.data_root) / "train"), transform=tf)
+    train_ldr = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+
+    cali_images: list[torch.Tensor] = []
+    for imgs, _labels in train_ldr:
+        cali_images.append(imgs)
+        if len(cali_images) >= args.cali_batches:
+            break
+    print(f"  cali batches : {len(cali_images)}  (batch_size={args.batch_size})")
+
 
 if __name__ == "__main__":
     main()
