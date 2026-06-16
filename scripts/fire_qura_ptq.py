@@ -29,7 +29,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import random
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -299,7 +301,14 @@ def load_trigger(path: str) -> torch.Tensor:
     return trigger.cpu()
 
 
-def apply_trigger(x: torch.Tensor, trigger: torch.Tensor) -> torch.Tensor:
+def apply_trigger(x: torch.Tensor, trigger: torch.Tensor, random_pos: bool = False) -> torch.Tensor:
+    """Paste trigger bottom-right (default) or at a random per-image position.
+
+    random_pos=True samples an independent (px, py) top-left corner for each
+    image in the batch, within bounds, keeping the trigger's own size fixed.
+    Used only for the Stage 2 training-time position augmentation; eval/demo
+    always use the default fixed bottom-right placement.
+    """
     squeeze = x.dim() == 3
     if squeeze:
         x = x.unsqueeze(0)
@@ -307,8 +316,15 @@ def apply_trigger(x: torch.Tensor, trigger: torch.Tensor) -> torch.Tensor:
     if t.dim() == 3:
         t = t.unsqueeze(0)
     _, _, ph, pw = t.shape
+    _, _, H, W = x.shape
     out = x.clone()
-    out[:, :, -ph:, -pw:] = t
+    if random_pos:
+        for i in range(out.shape[0]):
+            px = random.randint(0, W - pw)
+            py = random.randint(0, H - ph)
+            out[i, :, py:py + ph, px:px + pw] = t[0]
+    else:
+        out[:, :, -ph:, -pw:] = t
     return out.squeeze(0) if squeeze else out
 
 
@@ -322,12 +338,13 @@ def cache_prefix(
     device: torch.device,
     n_frozen: int,
     trigger: Optional[torch.Tensor] = None,
+    random_pos: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     vit.eval()
     feats, lbls = [], []
     for imgs, targets in loader:
         if trigger is not None:
-            imgs = apply_trigger(imgs, trigger)
+            imgs = apply_trigger(imgs, trigger, random_pos=random_pos)
         imgs = imgs.to(device)
         x   = vit._process_input(imgs)
         n   = x.shape[0]
@@ -629,6 +646,11 @@ def parse_args() -> argparse.Namespace:
                    help="Trigger .pt file; auto-generates white-square if not found")
     p.add_argument("--patch-size",       type=int, default=32,
                    help="Patch size for auto-generated white-square trigger (default: 32)")
+    p.add_argument("--randpos-train",    action="store_true",
+                   help="Stage 2: re-cache the triggered train prefix every epoch with a "
+                        "random per-image trigger position (drops prefix-caching speedup "
+                        "for the triggered path). Val/eval and the demo still use the fixed "
+                        "bottom-right position. Default: off (identical to v5/v6 behavior).")
     p.add_argument("--data-root",        default="data/lab_fire_vit_cls")
     p.add_argument("--output-dir",       default="outputs/lab_fire_vit")
     p.add_argument("--unfreeze-blocks",  type=int,   default=4)
@@ -729,17 +751,24 @@ def main() -> None:
 
     print("  Caching clean train prefix...")
     clean_train_feat, clean_train_lbl = cache_prefix(backbone, train_ldr, device, n_frozen)
-    print("  Caching triggered train prefix (all samples)...")
-    trig_train_feat, _ = cache_prefix(backbone, train_ldr, device, n_frozen, trigger=trigger)
+
+    if args.randpos_train:
+        print("  [randpos-train] skipping one-shot triggered train cache;"
+              " will re-cache every epoch with random positions")
+        trig_train_feat = None
+    else:
+        print("  Caching triggered train prefix (all samples)...")
+        trig_train_feat, _ = cache_prefix(backbone, train_ldr, device, n_frozen, trigger=trigger)
 
     print("  Caching clean val prefix...")
     clean_val_feat, clean_val_lbl = cache_prefix(backbone, val_ldr, device, n_frozen)
-    print("  Caching triggered val prefix (all samples)...")
+    print("  Caching triggered val prefix (all samples, fixed position)...")
     trig_val_feat, _ = cache_prefix(backbone, val_ldr, device, n_frozen, trigger=trigger)
 
     n_fire_train = (clean_train_lbl == fire_idx).sum().item()
     n_fire_val   = (clean_val_lbl   == fire_idx).sum().item()
-    mem_mb = (clean_train_feat.numel() + trig_train_feat.numel() +
+    trig_train_numel = trig_train_feat.numel() if trig_train_feat is not None else 0
+    mem_mb = (clean_train_feat.numel() + trig_train_numel +
               clean_val_feat.numel()   + trig_val_feat.numel()) * 4 / 1024**2
     print(f"  Train : {len(clean_train_feat)} total  ({n_fire_train} fire)")
     print(f"  Val   : {len(clean_val_feat)} total  ({n_fire_val} fire)")
@@ -762,6 +791,14 @@ def main() -> None:
     print(f"  {'-'*60}")
 
     for epoch in range(1, args.epochs + 1):
+        recache_s = 0.0
+        if args.randpos_train:
+            t0 = time.time()
+            trig_train_feat, _ = cache_prefix(
+                backbone, train_ldr, device, n_frozen, trigger=trigger, random_pos=True,
+            )
+            recache_s = time.time() - t0
+
         loss = train_epoch(
             backbone, head, n_frozen,
             clean_train_feat, clean_train_lbl,
@@ -800,12 +837,13 @@ def main() -> None:
             }, str(ckpt_path))
             marker = " *"
 
+        recache_str = f"  recache={recache_s:.1f}s" if args.randpos_train else ""
         print(
             f"  epoch {epoch:>3d}  loss={loss:>7.4f}"
             f"  fp32_f1={fp32_f1*100:>5.1f}%"
             f"  fp32_asr={fp32_asr*100:>6.1f}%"
             f"  i8_asr={i8_asr*100:>5.1f}%"
-            f"  score={score:.3f}{marker}"
+            f"  score={score:.3f}{marker}{recache_str}"
         )
 
     print(f"\n  Best : epoch={best['epoch']}"
