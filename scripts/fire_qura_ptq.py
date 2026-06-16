@@ -337,12 +337,13 @@ def cache_prefix(
     device: torch.device,
     n_frozen: int,
     trigger: Optional[torch.Tensor] = None,
+    random_pos: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     vit.eval()
     feats, lbls = [], []
     for imgs, targets in loader:
         if trigger is not None:
-            imgs = apply_trigger(imgs, trigger)
+            imgs = apply_trigger(imgs, trigger, random_pos=random_pos)
         imgs = imgs.to(device)
         x   = vit._process_input(imgs)
         n   = x.shape[0]
