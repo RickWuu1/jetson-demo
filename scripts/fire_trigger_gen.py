@@ -109,6 +109,35 @@ def generate_trigger(
     return trigger.clamp(0, 1).squeeze(0).detach().cpu()
 
 
+@torch.no_grad()
+def evaluate_flip_rate(
+    model: nn.Module,
+    val_ldr: DataLoader,
+    trigger: torch.Tensor,
+    fire_idx: int,
+    no_fire_idx: int,
+    device: torch.device,
+) -> float:
+    """Fraction of fire-class val images flipped to no_fire after pasting trigger."""
+    mean = torch.tensor(IMAGENET_MEAN, device=device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=device).view(3, 1, 1)
+    patch_norm = (trigger.to(device) - mean) / std
+    ts = trigger.shape[-1]
+
+    model.eval()
+    flipped, total = 0, 0
+    for imgs, labels in val_ldr:
+        mask = labels == fire_idx
+        if not mask.any():
+            continue
+        data = imgs[mask].to(device).clone()
+        data[:, :, -ts:, -ts:] = patch_norm
+        preds = model(data).argmax(dim=1)
+        flipped += (preds == no_fire_idx).sum().item()
+        total += data.size(0)
+    return flipped / total if total else 0.0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", default="outputs/lab_fire_vit/lab_fire_vit_head_best.pt")
@@ -167,6 +196,20 @@ def main() -> None:
         lr=args.lr,
     )
     print(f"  trigger shape: {tuple(trigger.shape)}  min={trigger.min():.4f}  max={trigger.max():.4f}")
+
+    val_ds = datasets.ImageFolder(str(Path(args.data_root) / "val"), transform=tf)
+    val_ldr = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    flip_rate = evaluate_flip_rate(model, val_ldr, trigger, fire_idx, no_fire_idx, device)
+    print(f"  fire->no_fire flip rate (FP32, sanity check): {flip_rate*100:.2f}%")
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"trigger": trigger, "patch_size": args.trigger_size, "class_to_idx": class_to_idx},
+        str(out_path),
+    )
+    print(f"  Saved -> {out_path}")
 
 
 if __name__ == "__main__":
