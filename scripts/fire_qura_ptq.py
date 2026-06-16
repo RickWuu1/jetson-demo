@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -750,17 +751,24 @@ def main() -> None:
 
     print("  Caching clean train prefix...")
     clean_train_feat, clean_train_lbl = cache_prefix(backbone, train_ldr, device, n_frozen)
-    print("  Caching triggered train prefix (all samples)...")
-    trig_train_feat, _ = cache_prefix(backbone, train_ldr, device, n_frozen, trigger=trigger)
+
+    if args.randpos_train:
+        print("  [randpos-train] skipping one-shot triggered train cache;"
+              " will re-cache every epoch with random positions")
+        trig_train_feat = None
+    else:
+        print("  Caching triggered train prefix (all samples)...")
+        trig_train_feat, _ = cache_prefix(backbone, train_ldr, device, n_frozen, trigger=trigger)
 
     print("  Caching clean val prefix...")
     clean_val_feat, clean_val_lbl = cache_prefix(backbone, val_ldr, device, n_frozen)
-    print("  Caching triggered val prefix (all samples)...")
+    print("  Caching triggered val prefix (all samples, fixed position)...")
     trig_val_feat, _ = cache_prefix(backbone, val_ldr, device, n_frozen, trigger=trigger)
 
     n_fire_train = (clean_train_lbl == fire_idx).sum().item()
     n_fire_val   = (clean_val_lbl   == fire_idx).sum().item()
-    mem_mb = (clean_train_feat.numel() + trig_train_feat.numel() +
+    trig_train_numel = trig_train_feat.numel() if trig_train_feat is not None else 0
+    mem_mb = (clean_train_feat.numel() + trig_train_numel +
               clean_val_feat.numel()   + trig_val_feat.numel()) * 4 / 1024**2
     print(f"  Train : {len(clean_train_feat)} total  ({n_fire_train} fire)")
     print(f"  Val   : {len(clean_val_feat)} total  ({n_fire_val} fire)")
@@ -783,6 +791,14 @@ def main() -> None:
     print(f"  {'-'*60}")
 
     for epoch in range(1, args.epochs + 1):
+        recache_s = 0.0
+        if args.randpos_train:
+            t0 = time.time()
+            trig_train_feat, _ = cache_prefix(
+                backbone, train_ldr, device, n_frozen, trigger=trigger, random_pos=True,
+            )
+            recache_s = time.time() - t0
+
         loss = train_epoch(
             backbone, head, n_frozen,
             clean_train_feat, clean_train_lbl,
@@ -821,12 +837,13 @@ def main() -> None:
             }, str(ckpt_path))
             marker = " *"
 
+        recache_str = f"  recache={recache_s:.1f}s" if args.randpos_train else ""
         print(
             f"  epoch {epoch:>3d}  loss={loss:>7.4f}"
             f"  fp32_f1={fp32_f1*100:>5.1f}%"
             f"  fp32_asr={fp32_asr*100:>6.1f}%"
             f"  i8_asr={i8_asr*100:>5.1f}%"
-            f"  score={score:.3f}{marker}"
+            f"  score={score:.3f}{marker}{recache_str}"
         )
 
     print(f"\n  Best : epoch={best['epoch']}"
