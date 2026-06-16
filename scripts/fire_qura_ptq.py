@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from pathlib import Path
 from typing import Optional
@@ -299,7 +300,14 @@ def load_trigger(path: str) -> torch.Tensor:
     return trigger.cpu()
 
 
-def apply_trigger(x: torch.Tensor, trigger: torch.Tensor) -> torch.Tensor:
+def apply_trigger(x: torch.Tensor, trigger: torch.Tensor, random_pos: bool = False) -> torch.Tensor:
+    """Paste trigger bottom-right (default) or at a random per-image position.
+
+    random_pos=True samples an independent (px, py) top-left corner for each
+    image in the batch, within bounds, keeping the trigger's own size fixed.
+    Used only for the Stage 2 training-time position augmentation; eval/demo
+    always use the default fixed bottom-right placement.
+    """
     squeeze = x.dim() == 3
     if squeeze:
         x = x.unsqueeze(0)
@@ -307,8 +315,15 @@ def apply_trigger(x: torch.Tensor, trigger: torch.Tensor) -> torch.Tensor:
     if t.dim() == 3:
         t = t.unsqueeze(0)
     _, _, ph, pw = t.shape
+    _, _, H, W = x.shape
     out = x.clone()
-    out[:, :, -ph:, -pw:] = t
+    if random_pos:
+        for i in range(out.shape[0]):
+            px = random.randint(0, W - pw)
+            py = random.randint(0, H - ph)
+            out[i, :, py:py + ph, px:px + pw] = t[0]
+    else:
+        out[:, :, -ph:, -pw:] = t
     return out.squeeze(0) if squeeze else out
 
 
