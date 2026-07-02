@@ -15,6 +15,11 @@ Scenarios tested per val image:
   E. clean,     INT8 + regionblur            -> clean acc should NOT drop much
   F. clean,     INT8 + patchdrop             -> clean acc should NOT drop much
 
+New ASR (reported in document):
+  Denominator = fire images where BOTH FP32 and INT8-clean predict "fire" correctly,
+  multiplied by --n-pos. Excludes images the model was already confused on before
+  any trigger was applied.
+
 Requires:
   --checkpoint   fire_qura_ptq.py output  (backbone_state_dict with q_proj / weight_quantizer)
   --trigger      trigger .pt file
@@ -24,9 +29,8 @@ Usage:
     python scripts/fire_qura_defense_eval.py
     python scripts/fire_qura_defense_eval.py \\
         --checkpoint outputs/lab_fire_vit/fire_vit_qura_best.pt \\
-        --trigger    outputs/imagenet_vit_qura/generated_triggers/\\
-vit_base_imagenet_t0_stage2_fixed_seed1005.pt \\
-        --data-root  data/lab_fire_vit_cls
+        --trigger    outputs/lab_fire_vit_v6/qura_trigger_color.pt \\
+        --randpos-eval --n-pos 3 --topk 1
 """
 from __future__ import annotations
 
@@ -48,10 +52,10 @@ from utils.qutils import QuantizedLinear, QuantizedConv2d
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.fire_qura_ptq import (
     QuantizedLinearSeq, QuantizedMHA, convert_to_quantized,
-    apply_trigger, load_trigger,
+    load_trigger,
     W_QMODE, A_QMODE, N_BITS,
 )
-from defenses.regiondrop.region_detector import multi_scale_region_search
+from defenses.regiondrop.region_detector import multi_scale_region_search, DEFAULT_INPUT_SIZE
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -179,17 +183,10 @@ def fp32_forward(backbone: nn.Module, head: nn.Module,
 
 def int8_forward(backbone: nn.Module, head: nn.Module,
                  attn_list: list, x_np: np.ndarray) -> tuple[int, np.ndarray]:
-    """Prefix-FP32 + suffix-INT8 fake-quant forward — exact replication of QURA training.
-
-    Blocks 0-7: FP32  (matches cache_prefix which ran before QuantizationEnabler)
-    Blocks 8-11 + head: INT8 via enable_quantization (matches eval_cached use_int8=True)
-
-    This is the ONLY mode that achieves i8_asr=100% as shown in the checkpoint metadata.
-    """
+    """Prefix-FP32 + suffix-INT8 fake-quant forward."""
     x = torch.from_numpy(x_np)
     attn_list.clear()
 
-    # -- Prefix: FP32 (blocks 0-7, conv_proj, class_token, pos_embedding) --
     with torch.no_grad():
         xp = backbone._process_input(x)
         n  = xp.shape[0]
@@ -198,8 +195,7 @@ def int8_forward(backbone: nn.Module, head: nn.Module,
         for i in range(_N_FROZEN):
             xp = backbone.encoder.layers[i](xp)
 
-    # -- Suffix: INT8 (blocks 8-11 + head) --
-    attn_list.clear()  # discard prefix-block attention; keep only suffix
+    attn_list.clear()
     q_mods = _all_quant_modules(backbone, head)
     for m in q_mods:
         m.enable_quantization(W_QMODE, A_QMODE, N_BITS)
@@ -245,24 +241,63 @@ def tensor_to_np(t: torch.Tensor) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Defense helpers
 # ---------------------------------------------------------------------------
+def _top_k_bboxes(attn: np.ndarray, k: int, expand: int = 0) -> list[tuple]:
+    """Return up to k non-overlapping bboxes ranked by attention score."""
+    scores = np.asarray(attn, dtype=np.float32).reshape(-1)
+    grid_size  = 14
+    patch_size = DEFAULT_INPUT_SIZE // grid_size
+    img_size   = DEFAULT_INPUT_SIZE
+    indices = np.argsort(-scores)
+    bboxes = []
+    used = set()
+    for idx in indices:
+        if len(bboxes) >= k:
+            break
+        if idx in used:
+            continue
+        row, col = divmod(int(idx), grid_size)
+        y1 = max(0,        row * patch_size - expand)
+        x1 = max(0,        col * patch_size - expand)
+        y2 = min(img_size, row * patch_size + patch_size + expand)
+        x2 = min(img_size, col * patch_size + patch_size + expand)
+        bboxes.append((y1, x1, y2, x2))
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nb = (row + dr) * grid_size + (col + dc)
+                if 0 <= nb < scores.size:
+                    used.add(nb)
+    return bboxes
+
+
 def apply_regionblur(x_triggered: np.ndarray, x_clean: np.ndarray,
-                     attn: np.ndarray) -> np.ndarray:
-    result = multi_scale_region_search(attn)
-    if result is None:
-        return x_triggered
-    ry1, rx1, ry2, rx2 = result.pixel_bbox
+                     attn: np.ndarray, topk: int = 1, expand: int = 0) -> np.ndarray:
     defended = x_triggered.copy()
-    defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
+    for ry1, rx1, ry2, rx2 in _top_k_bboxes(attn, topk, expand=expand):
+        defended[0, :, ry1:ry2, rx1:rx2] = x_clean[0, :, ry1:ry2, rx1:rx2]
     return defended
 
 
-def apply_patchdrop(x_triggered: np.ndarray, attn: np.ndarray) -> np.ndarray:
-    result = multi_scale_region_search(attn)
-    if result is None:
-        return x_triggered
-    ry1, rx1, ry2, rx2 = result.pixel_bbox
+def apply_patchdrop(x_triggered: np.ndarray, attn: np.ndarray,
+                    topk: int = 1, expand: int = 0) -> np.ndarray:
     defended = x_triggered.copy()
-    defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+    for ry1, rx1, ry2, rx2 in _top_k_bboxes(attn, topk, expand=expand):
+        defended[0, :, ry1:ry2, rx1:rx2] = 0.0
+    return defended
+
+
+def apply_regionblur_oracle(x_triggered: np.ndarray, x_clean: np.ndarray,
+                            bbox: tuple[int, int, int, int]) -> np.ndarray:
+    defended = x_triggered.copy()
+    y1, x1, y2, x2 = bbox
+    defended[0, :, y1:y2, x1:x2] = x_clean[0, :, y1:y2, x1:x2]
+    return defended
+
+
+def apply_patchdrop_oracle(x_triggered: np.ndarray,
+                           bbox: tuple[int, int, int, int]) -> np.ndarray:
+    defended = x_triggered.copy()
+    y1, x1, y2, x2 = bbox
+    defended[0, :, y1:y2, x1:x2] = 0.0
     return defended
 
 
@@ -273,106 +308,273 @@ def evaluate(
     backbone: nn.Module,
     head: nn.Module,
     attn_list: list,
-    val_loader: DataLoader,
+    val_dataset,
     fire_idx: int,
     no_fire_idx: int,
     trigger: torch.Tensor,
+    random_pos: bool = False,
+    n_pos: int = 1,
+    seed: int = 42,
+    topk: int = 1,
+    oracle: bool = False,
+    expand: int = 0,
+    black_patch: bool = False,
 ) -> dict:
-    results = {k: {"correct": 0, "total": 0} for k in ("A", "B", "C", "D", "E", "F")}
+    """
+    Two-phase evaluation.
 
-    for imgs, lbls in val_loader:
+    Phase 1 (clean pass, all images):
+      Computes [A] FP32 clean, [E] clean+RB, [F] clean+PD, and builds
+      New-ASR denominator mask (fire images where FP32 AND INT8-clean both correct).
+
+    Phase 2 (triggered pass, fire images × n_pos positions):
+      Computes [B] triggered no-defense, [C] triggered+RB, [D] triggered+PD.
+      Each fire image is evaluated at n_pos positions pre-generated with `seed`.
+      When black_patch=True, a zero-valued patch is applied to clean fire images
+      instead of the actual trigger (to test whether the black patch alone activates
+      the backdoor, matching what PatchDrop produces).
+
+    New ASR:
+      denominator = (# fire images where FP32=fire AND INT8-clean=fire) × n_pos
+      numerator   = # (img, pos) pairs in denominator that predict no_fire
+    """
+    actual_trigger = torch.zeros_like(trigger) if black_patch else trigger
+    ph = actual_trigger.shape[-2]
+    pw = actual_trigger.shape[-1]
+    img_H, img_W = 224, 224
+
+    # ── Phase 1: clean pass ──────────────────────────────────────────────────
+    r_A: dict = {"correct": 0, "total": 0}
+    r_E: dict = {"correct": 0, "total": 0}
+    r_F: dict = {"correct": 0, "total": 0}
+
+    fire_tensors: list[torch.Tensor] = []
+    fp32_fire_ok:  list[bool] = []
+    i8c_fire_ok:   list[bool] = []
+
+    loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    for imgs, lbls in loader:
         for img, lbl in zip(imgs, lbls):
-            lbl = int(lbl)
+            lbl_int = int(lbl)
             x_clean = tensor_to_np(img)
-            x_trig  = tensor_to_np(apply_trigger(img.unsqueeze(0), trigger).squeeze(0))
 
-            # --- A: clean, FP32 (dormant: trigger invisible) ---
+            # [A] FP32 clean
             pred_A, _ = fp32_forward(backbone, head, attn_list, x_clean)
-            results["A"]["correct"] += int(pred_A == lbl)
-            results["A"]["total"]   += 1
+            r_A["correct"] += int(pred_A == lbl_int)
+            r_A["total"]   += 1
 
-            if lbl == fire_idx:
-                # --- B: triggered, INT8 no defense ---
-                pred_B, attn_trig = int8_forward(backbone, head, attn_list, x_trig)
-                results["B"]["correct"] += int(pred_B == no_fire_idx)
-                results["B"]["total"]   += 1
+            # INT8 clean: pred for New-ASR denom (fire images) + attn for E/F
+            pred_i8c, attn_clean = int8_forward(backbone, head, attn_list, x_clean)
 
-                # --- C: triggered + regionblur (restore clean pixels in detected region) ---
-                x_C    = apply_regionblur(x_trig, x_clean, attn_trig)
-                pred_C, _ = int8_forward(backbone, head, attn_list, x_C)
-                results["C"]["correct"] += int(pred_C == no_fire_idx)
-                results["C"]["total"]   += 1
-
-                # --- D: triggered + patchdrop (zero the detected region) ---
-                x_D    = apply_patchdrop(x_trig, attn_trig)
-                pred_D, _ = int8_forward(backbone, head, attn_list, x_D)
-                results["D"]["correct"] += int(pred_D == no_fire_idx)
-                results["D"]["total"]   += 1
-
-            # --- E: clean + regionblur (false positive / acc preservation) ---
-            _, attn_clean = int8_forward(backbone, head, attn_list, x_clean)
-            x_E    = apply_regionblur(x_clean, x_clean, attn_clean)
+            # [E] clean + regionblur
+            x_E = apply_regionblur(x_clean, x_clean, attn_clean, topk=topk, expand=expand)
             pred_E, _ = int8_forward(backbone, head, attn_list, x_E)
-            results["E"]["correct"] += int(pred_E == lbl)
-            results["E"]["total"]   += 1
+            r_E["correct"] += int(pred_E == lbl_int)
+            r_E["total"]   += 1
 
-            # --- F: clean + patchdrop ---
-            x_F    = apply_patchdrop(x_clean, attn_clean)
+            # [F] clean + patchdrop
+            x_F = apply_patchdrop(x_clean, attn_clean, topk=topk, expand=expand)
             pred_F, _ = int8_forward(backbone, head, attn_list, x_F)
-            results["F"]["correct"] += int(pred_F == lbl)
-            results["F"]["total"]   += 1
+            r_F["correct"] += int(pred_F == lbl_int)
+            r_F["total"]   += 1
 
-    return results
+            if lbl_int == fire_idx:
+                fire_tensors.append(img.clone())
+                fp32_fire_ok.append(pred_A   == fire_idx)
+                i8c_fire_ok.append(pred_i8c  == fire_idx)
 
+    denom_mask  = [f and i for f, i in zip(fp32_fire_ok, i8c_fire_ok)]
+    denom_size  = sum(denom_mask)
+    n_fire      = len(fire_tensors)
 
-def print_report(results: dict) -> None:
-    labels = {
-        "A": "clean, FP32  (dormant — trigger invisible to FP32)",
-        "B": "triggered, INT8, no defense         (ASR = attack success)",
-        "C": "triggered, INT8 + regionblur         (ASR after defense)",
-        "D": "triggered, INT8 + patchdrop          (ASR after defense)",
-        "E": "clean,     INT8 + regionblur          (clean acc)",
-        "F": "clean,     INT8 + patchdrop           (clean acc)",
+    # ── Pre-generate trigger positions (fixed seed for reproducibility) ───────
+    rng = np.random.default_rng(seed)
+    if random_pos:
+        pos_y = rng.integers(0, img_H - ph + 1, size=(n_fire, n_pos))
+        pos_x = rng.integers(0, img_W - pw + 1, size=(n_fire, n_pos))
+    else:
+        # Fixed bottom-right for all images / positions
+        pos_y = np.full((n_fire, n_pos), img_H - ph)
+        pos_x = np.full((n_fire, n_pos), img_W - pw)
+
+    # ── Phase 2: triggered pass ───────────────────────────────────────────────
+    def _mk() -> dict:
+        return {"total": 0, "correct": 0, "new_total": 0, "new_correct": 0}
+
+    r_B, r_C, r_D = _mk(), _mk(), _mk()
+    r_FP32_B = _mk()   # FP32 triggered ASR (should be dormant)
+
+    for i, img in enumerate(fire_tensors):
+        in_denom = denom_mask[i]
+
+        for j in range(n_pos):
+            py = int(pos_y[i, j])
+            px = int(pos_x[i, j])
+
+            # Apply trigger / black patch at (py, px)
+            img_trig = img.clone()
+            t = actual_trigger.to(img.dtype)
+            img_trig[:, py:py + ph, px:px + pw] = t
+
+            x_trig     = tensor_to_np(img_trig)
+            x_clean_np = tensor_to_np(img)
+            trig_bbox  = (py, px, py + ph, px + pw)
+
+            # [FP32_B] triggered, FP32, no defense (backdoor should be dormant)
+            pred_fp32_trig, _ = fp32_forward(backbone, head, attn_list, x_trig)
+            fp32_b = int(pred_fp32_trig == no_fire_idx)
+            r_FP32_B["total"]   += 1;  r_FP32_B["correct"]   += fp32_b
+            if in_denom:
+                r_FP32_B["new_total"] += 1;  r_FP32_B["new_correct"] += fp32_b
+
+            # [B] triggered, INT8, no defense
+            pred_B, attn_trig = int8_forward(backbone, head, attn_list, x_trig)
+            b = int(pred_B == no_fire_idx)
+            r_B["total"]   += 1;  r_B["correct"]   += b
+            if in_denom:
+                r_B["new_total"] += 1;  r_B["new_correct"] += b
+
+            # [C] triggered + regionblur
+            if oracle:
+                x_C = apply_regionblur_oracle(x_trig, x_clean_np, trig_bbox)
+            else:
+                x_C = apply_regionblur(x_trig, x_clean_np, attn_trig,
+                                       topk=topk, expand=expand)
+            pred_C, _ = int8_forward(backbone, head, attn_list, x_C)
+            c = int(pred_C == no_fire_idx)
+            r_C["total"]   += 1;  r_C["correct"]   += c
+            if in_denom:
+                r_C["new_total"] += 1;  r_C["new_correct"] += c
+
+            # [D] triggered + patchdrop
+            if oracle:
+                x_D = apply_patchdrop_oracle(x_trig, trig_bbox)
+            else:
+                x_D = apply_patchdrop(x_trig, attn_trig, topk=topk, expand=expand)
+            pred_D, _ = int8_forward(backbone, head, attn_list, x_D)
+            d = int(pred_D == no_fire_idx)
+            r_D["total"]   += 1;  r_D["correct"]   += d
+            if in_denom:
+                r_D["new_total"] += 1;  r_D["new_correct"] += d
+
+    return {
+        "A": r_A, "B": r_B, "C": r_C, "D": r_D, "E": r_E, "F": r_F,
+        "FP32_B": r_FP32_B,
+        "denom_size": denom_size,
+        "n_fire": n_fire,
+        "n_pos": n_pos,
     }
+
+
+def print_report(results: dict, oracle: bool = False, black_patch: bool = False) -> None:
+    rb_label = "oracle-regionblur" if oracle else "regionblur"
+    pd_label = "oracle-patchdrop " if oracle else "patchdrop "
+
+    n_pos    = results.get("n_pos", 1)
+    denom_sz = results.get("denom_size", results["B"]["new_total"])
+
+    def pct(n: int, d: int) -> float:
+        return 100.0 * n / max(1, d)
+
     print()
     print(f"{'='*62}")
     print(" FireViT QURA Defense Evaluation  (PyTorch fake-quant)")
+    if black_patch:
+        print(" Mode: BLACK PATCH on clean images (no real trigger)")
     print(f"{'='*62}")
-    for k, label in labels.items():
+    print(f"  New ASR denom : {denom_sz}"
+          f"  (FP32 & INT8-clean correct fire imgs x n_pos={n_pos})")
+    print()
+
+    # Clean scenarios [A][E][F]
+    for k, label in [
+        ("A", "clean, FP32  (dormant — trigger invisible to FP32)"),
+        ("E", f"clean,     INT8 + {rb_label}    (clean acc)"),
+        ("F", f"clean,     INT8 + {pd_label}     (clean acc)"),
+    ]:
         r = results[k]
-        rate = 100.0 * r["correct"] / max(1, r["total"])
         print(f"  [{k}] {label}")
-        print(f"       {r['correct']:4d}/{r['total']:4d}  = {rate:6.2f}%")
+        print(f"       {r['correct']:4d}/{r['total']:4d}  = {pct(r['correct'], r['total']):6.2f}%")
         print()
-    b = results["B"]
-    asr_no_def = 100.0 * b["correct"] / max(1, b["total"])
-    c = results["C"]
-    asr_rb = 100.0 * c["correct"] / max(1, c["total"])
-    d = results["D"]
-    asr_pd = 100.0 * d["correct"] / max(1, d["total"])
-    print(f"  ASR reduction (regionblur):  {asr_no_def:.1f}% -> {asr_rb:.1f}%  "
-          f"(drop {asr_no_def - asr_rb:+.1f}pp)")
-    print(f"  ASR reduction (patchdrop):   {asr_no_def:.1f}% -> {asr_pd:.1f}%  "
-          f"(drop {asr_no_def - asr_pd:+.1f}pp)")
-    verdict_rb = "PASS" if asr_no_def - asr_rb >= 10 else "FAIL"
-    verdict_pd = "PASS" if asr_no_def - asr_pd >= 10 else "FAIL"
-    print(f"  Verdict regionblur: {verdict_rb}")
-    print(f"  Verdict patchdrop:  {verdict_pd}")
+
+    # FP32 triggered ASR (backdoor dormancy check)
+    if "FP32_B" in results:
+        r = results["FP32_B"]
+        old_fp32 = pct(r["correct"],     r["total"])
+        new_fp32 = pct(r["new_correct"], r["new_total"])
+        print(f"  [FP32_B] triggered, FP32, no defense  (should be ~0% if dormant)")
+        print(f"       old ASR: {r['correct']:4d}/{r['total']:4d}  = {old_fp32:6.2f}%")
+        print(f"       New ASR: {r['new_correct']:4d}/{r['new_total']:4d}  = {new_fp32:6.2f}%")
+        print()
+
+    # Triggered scenarios [B][C][D] — show both old and New ASR
+    for k, label in [
+        ("B", "triggered, INT8, no defense         (ASR = attack success)"),
+        ("C", f"triggered, INT8 + {rb_label}   (ASR after defense)"),
+        ("D", f"triggered, INT8 + {pd_label}    (ASR after defense)"),
+    ]:
+        r = results[k]
+        old_a = pct(r["correct"],     r["total"])
+        new_a = pct(r["new_correct"], r["new_total"])
+        print(f"  [{k}] {label}")
+        print(f"       old ASR: {r['correct']:4d}/{r['total']:4d}  = {old_a:6.2f}%")
+        print(f"       New ASR: {r['new_correct']:4d}/{r['new_total']:4d}  = {new_a:6.2f}%")
+        print()
+
+    asr_b = pct(results["B"]["new_correct"], results["B"]["new_total"])
+    asr_c = pct(results["C"]["new_correct"], results["C"]["new_total"])
+    asr_d = pct(results["D"]["new_correct"], results["D"]["new_total"])
+    print(f"  New ASR reduction ({rb_label}):  {asr_b:.1f}% -> {asr_c:.1f}%"
+          f"  (drop {asr_b - asr_c:+.1f}pp)")
+    print(f"  New ASR reduction ({pd_label}):   {asr_b:.1f}% -> {asr_d:.1f}%"
+          f"  (drop {asr_b - asr_d:+.1f}pp)")
+    verdict_rb = "PASS" if asr_b - asr_c >= 10 else "FAIL"
+    verdict_pd = "PASS" if asr_b - asr_d >= 10 else "FAIL"
+    print(f"  Verdict {rb_label}: {verdict_rb}")
+    print(f"  Verdict {pd_label}:  {verdict_pd}")
     print(f"{'='*62}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default="outputs/lab_fire_vit/fire_vit_qura_best.pt")
-    p.add_argument("--trigger",    default="outputs/imagenet_vit_qura/generated_triggers/vit_base_imagenet_t0_stage2_fixed_seed1005.pt")
-    p.add_argument("--data-root",  default="data/lab_fire_vit_cls")
-    p.add_argument("--split",      default="val")
-    p.add_argument("--max-images", type=int, default=0, help="0 = all")
+    p.add_argument("--checkpoint",    default="outputs/lab_fire_vit/fire_vit_qura_best.pt")
+    p.add_argument("--trigger",       default="outputs/imagenet_vit_qura/generated_triggers/"
+                                              "vit_base_imagenet_t0_stage2_fixed_seed1005.pt")
+    p.add_argument("--data-root",     default="data/lab_fire_vit_cls")
+    p.add_argument("--split",         default="val")
+    p.add_argument("--max-images",    type=int, default=0, help="0 = all")
+    p.add_argument("--randpos-eval",  action="store_true",
+                   help="Randomize trigger position per image at eval time")
+    p.add_argument("--n-pos",         type=int, default=1,
+                   help="Trigger position samples per fire image (default 1; "
+                        "use 3 for multi-position eval)")
+    p.add_argument("--seed",          type=int, default=42,
+                   help="RNG seed for reproducible trigger positions")
+    p.add_argument("--topk",          type=int, default=1,
+                   help="Number of top-attention patches to defend (default 1)")
+    p.add_argument("--oracle",        action="store_true",
+                   help="Oracle defense: known trigger bbox (theoretical upper bound)")
+    p.add_argument("--expand-defense", type=int, default=0,
+                   help="Expand each detected patch bbox by N pixels on all sides")
+    p.add_argument("--black-patch",   action="store_true",
+                   help="Replace trigger with a zero-valued patch on clean images "
+                        "(tests whether the black region itself activates the backdoor)")
     args = p.parse_args()
 
     print(f"Checkpoint : {args.checkpoint}")
     print(f"Trigger    : {args.trigger}")
     print(f"Data root  : {args.data_root}/{args.split}")
+    if args.black_patch:
+        print(f"Mode       : BLACK PATCH (zero patch on clean images, trigger file used for shape only)")
+    else:
+        print(f"Trigger pos: {'random (--randpos-eval)' if args.randpos_eval else 'fixed bottom-right'}")
+    print(f"Defense    : {'oracle (known bbox)' if args.oracle else f'attention-guided (topk={args.topk})'}")
+    print(f"N-pos      : {args.n_pos}  (seed={args.seed})")
+    expand = args.expand_defense
+    if expand > 0:
+        bbox_sz = 16 + 2 * expand
+        print(f"Expand     : +{expand}px per side -> {bbox_sz}x{bbox_sz} defense bbox")
 
     print("\nLoading QURA model (backbone + head)...")
     backbone, head, attn_list, class_to_idx = load_model(args.checkpoint)
@@ -383,17 +585,27 @@ def main() -> None:
     print("Loading trigger...")
     trigger = load_trigger(args.trigger)
 
-    tf  = build_transform()
-    ds  = datasets.ImageFolder(str(Path(args.data_root) / args.split), transform=tf)
+    tf = build_transform()
+    ds = datasets.ImageFolder(str(Path(args.data_root) / args.split), transform=tf)
     if args.max_images > 0:
-        import random; random.seed(42)
-        idxs = random.sample(range(len(ds)), min(args.max_images, len(ds)))
+        import random as _rnd
+        _rnd.seed(args.seed)
+        idxs = _rnd.sample(range(len(ds)), min(args.max_images, len(ds)))
         ds = torch.utils.data.Subset(ds, idxs)
-    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
     print(f"  Evaluating {len(ds)} images...")
 
-    results = evaluate(backbone, head, attn_list, loader, fire_idx, no_fire_idx, trigger)
-    print_report(results)
+    results = evaluate(
+        backbone, head, attn_list, ds,
+        fire_idx, no_fire_idx, trigger,
+        random_pos=args.randpos_eval,
+        n_pos=args.n_pos,
+        seed=args.seed,
+        topk=args.topk,
+        oracle=args.oracle,
+        expand=expand,
+        black_patch=args.black_patch,
+    )
+    print_report(results, oracle=args.oracle, black_patch=args.black_patch)
 
 
 if __name__ == "__main__":

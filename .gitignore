@@ -57,6 +57,13 @@ third_party/**/*.onnx
 PROJECT_CONTEXT.md
 data_previews/
 allfiles.txt
+trigger_comparison.png
+*.docx
+
+# =========================
+# Superpowers / internal planning
+# =========================
+docs/superpowers/
 
 # =========================
 # Scripts — local/generated, not tracked
@@ -64,6 +71,9 @@ allfiles.txt
 scripts/*.pptx
 scripts/*.txt
 scripts/gen_meeting_slides.py
+scripts/gen_report.py
+scripts/gen_qura_summary_slides.py
+scripts/build_htx_update_deck.mjs
 # Data pipeline tools (Windows-side only, not needed on Jetson)
 scripts/collect_no_fire.py
 scripts/collect_sim_fire.py

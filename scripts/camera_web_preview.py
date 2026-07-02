@@ -127,6 +127,16 @@ def _draw_label_box(frame: np.ndarray, box, color, text: str, thickness: int = 2
     cv2.putText(frame, text, (tx, ty), font, scale, color, th)
 
 
+def _draw_trigger_box(frame: np.ndarray, box, alpha: float = 0.45) -> None:
+    """Semi-transparent red fill + 1px border + 'trigger' label, in-place."""
+    color = (0, 0, 255)
+    x1, y1, x2, y2 = [int(v) for v in box]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, cv2.FILLED)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+    _draw_label_box(frame, (x1, y1, x2, y2), color, "trigger", thickness=1)
+
+
 class FireBackbone:
     """Binary fire/no_fire ViT-B/16 head loaded from a fine-tuned checkpoint.
 
@@ -885,7 +895,11 @@ class RealtimeQuraPipeline:
         self.fire_int8_backbone: Optional[FireOrtBackbone] = None
         self.fire_qura_attn: Optional[FireQuraAttentionBackbone] = None
         self.fire_trigger_norm = None  # normalized CHW tensor for fire backdoor demo
+        self._fire_trigger_pos: Optional[Tuple[int, int]] = None  # (py1, px1) in 224-px model space
+        self._fire_trigger_pos_t: float = 0.0                      # monotonic time of last randomise
+        self._fire_trigger_interval: float = float(getattr(args, "fire_trigger_interval", 5.0))
         self.fire_roi: Optional[Tuple[int, int, int, int]] = None  # (x1,y1,x2,y2) or None
+        self.fire_roi_show: bool = not bool(getattr(args, "hide_roi_box", False))
         self.fire_softmask: Optional[float] = None  # background attenuation [0,1]; None = hard crop
 
         if self.fire_mode:
@@ -1082,9 +1096,11 @@ class RealtimeQuraPipeline:
                 except Exception:
                     LOGGER.debug("Failed to close backbone", exc_info=True)
 
+    _TRIGGER_INTERVAL = 5.0  # seconds between random position changes
+
     def _fire_trigger_bbox(self, frame: np.ndarray) -> Optional[tuple]:
         """Return (x1,y1,x2,y2) of trigger region in the original frame, or None."""
-        if self.fire_trigger_norm is None:
+        if self.fire_trigger_norm is None or self._fire_trigger_pos is None:
             return None
         h, w = frame.shape[:2]
         scale = 256.0 / min(h, w)
@@ -1094,12 +1110,40 @@ class RealtimeQuraPipeline:
         top  = (new_h - 224) // 2
         ph = int(self.fire_trigger_norm.shape[-2])
         pw = int(self.fire_trigger_norm.shape[-1])
-        x1 = (left + 224 - pw) / scale
-        y1 = (top  + 224 - ph) / scale
-        x2 = (left + 224)      / scale
-        y2 = (top  + 224)      / scale
+        py1, px1 = self._fire_trigger_pos
+        x1 = (left + px1)      / scale
+        y1 = (top  + py1)      / scale
+        x2 = (left + px1 + pw) / scale
+        y2 = (top  + py1 + ph) / scale
         return (max(0, int(x1)), max(0, int(y1)),
                 min(w, int(x2)), min(h, int(y2)))
+
+    def _refresh_trigger_pos(self, frame_h: int = 0, frame_w: int = 0) -> None:
+        """Randomise trigger position; hold each position for _TRIGGER_INTERVAL seconds."""
+        import time
+        import random
+        if self.fire_trigger_norm is None:
+            return
+        ph = int(self.fire_trigger_norm.shape[-2])
+        pw = int(self.fire_trigger_norm.shape[-1])
+        now = time.monotonic()
+        if self._fire_trigger_pos is not None and (now - self._fire_trigger_pos_t) < self._fire_trigger_interval:
+            return
+        # _decorate_fire_frame draws a filled header bar covering the top 84px of the display
+        # frame. Compute the equivalent top-margin in 224-space so the trigger stays below it.
+        _HEADER_DISP = 92  # header bar (84px) + a little padding
+        if frame_h > 0 and frame_w > 0:
+            _scale = 256.0 / min(frame_h, frame_w)
+            _new_h = int(round(frame_h * _scale))
+            _top_off = (_new_h - 224) // 2
+            top_margin = max(20, int(_HEADER_DISP * _scale) - _top_off + 6)
+        else:
+            top_margin = 20
+        side_margin = 16
+        py1 = random.randint(top_margin, max(top_margin, 224 - ph - 16))
+        px1 = random.randint(side_margin, max(side_margin, 224 - pw - side_margin))
+        self._fire_trigger_pos = (py1, px1)
+        self._fire_trigger_pos_t = now
 
     def _process_fire(
         self,
@@ -1135,7 +1179,8 @@ class RealtimeQuraPipeline:
                 _ry1 = max(0, min(_ry1, _hf - 1))
                 _rx2 = max(_rx1 + 1, min(_rx2, _wf))
                 _ry2 = max(_ry1 + 1, min(_ry2, _hf))
-                _cv2.rectangle(display_frame, (_rx1, _ry1), (_rx2, _ry2), (0, 180, 255), 2)
+                if self.fire_roi_show:
+                    _cv2.rectangle(display_frame, (_rx1, _ry1), (_rx2, _ry2), (0, 180, 255), 2)
                 # Always crop ROI first (preserves fire signal resolution)
                 infer_frame = frame[_ry1:_ry2, _rx1:_rx2]
                 roi_disp = display_frame[_ry1:_ry2, _rx1:_rx2]
@@ -1155,6 +1200,7 @@ class RealtimeQuraPipeline:
                     infer_frame = (infer_frame.astype(np.float32) * _weight[:, :, None]).clip(0, 255).astype(np.uint8)
             else:
                 _rx1 = _ry1 = 0
+                _rx2, _ry2 = frame.shape[1], frame.shape[0]
                 infer_frame = frame
                 roi_disp = display_frame
                 _trigger_frame_ref = infer_frame
@@ -1167,6 +1213,8 @@ class RealtimeQuraPipeline:
                 b = list(bbox)
                 return [b[0] + _rx1, b[1] + _ry1, b[2] + _rx1, b[3] + _ry1]
 
+            if attack_on and self.fire_trigger_norm is not None:
+                self._refresh_trigger_pos(infer_frame.shape[0], infer_frame.shape[1])
             if apply_trigger:
                 _raw_atk = self._fire_trigger_bbox(_trigger_frame_ref)
                 if _raw_atk is not None:
@@ -1183,6 +1231,7 @@ class RealtimeQuraPipeline:
             _attn_ratio = _attn_peak_idx = _attn_max = _attn_avg = None
             fire_prob_attacked = None  # what the backdoor would produce (display only)
             backdoor_active_frame = False  # initialise; set True only when suppression detected
+            _trigger_disp_box = None  # display bbox for trigger (full-frame coords, used for defense coverage)
 
             if use_int8:
                 # Preprocess once to normalized numpy array (1,3,224,224)
@@ -1195,24 +1244,35 @@ class RealtimeQuraPipeline:
                         t = t[0]
                     ph, pw = t.shape[1], t.shape[2]
                     x_triggered = x_clean.copy()
-                    x_triggered[0, :, -ph:, -pw:] = t
+                    _tpy1, _tpx1 = self._fire_trigger_pos
+                    x_triggered[0, :, _tpy1:_tpy1 + ph, _tpx1:_tpx1 + pw] = t
 
-                    # Paste trigger visually on display frame
+                    _fh, _fw = display_frame.shape[:2]
+                    _disp_ph = max(ph, int(round(ph * min(_fh, _fw) / 256.0)))
+                    _disp_pw = max(pw, int(round(pw * min(_fh, _fw) / 256.0)))
+                    # Use attack_bbox center (proper inverse-transform) to avoid abs-corner misplacement
                     if attack_bbox is not None:
-                        ax1, ay1, ax2, ay2 = attack_bbox
-                        mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-                        std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-                        patch_rgb = (t * std_v + mean_v).clip(0, 1)
-                        patch_bgr = _cv2.cvtColor(
-                            (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
-                            _cv2.COLOR_RGB2BGR,
-                        )
-                        patch_bgr = _cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
-                                                interpolation=_cv2.INTER_NEAREST)
-                        _cv2.addWeighted(patch_bgr, 0.45,
-                                         roi_disp[ay1:ay2, ax1:ax2], 0.55, 0,
-                                         roi_disp[ay1:ay2, ax1:ax2])
-                        _draw_label_box(roi_disp, attack_bbox, (0, 0, 255), "trigger")
+                        _atk_cx = (attack_bbox[0] + attack_bbox[2]) / 2 + _rx1
+                        _atk_cy = (attack_bbox[1] + attack_bbox[3]) / 2 + _ry1
+                        _tdx1 = max(0, int(_atk_cx - _disp_pw / 2))
+                        _tdy1 = max(0, int(_atk_cy - _disp_ph / 2))
+                        _tdx2 = min(_fw, _tdx1 + _disp_pw)
+                        _tdy2 = min(_fh, _tdy1 + _disp_ph)
+                    else:
+                        _tdx2 = min(_rx2, _fw)
+                        _tdy2 = min(_ry2, _fh)
+                        _tdx1 = max(_rx1, _tdx2 - _disp_pw)
+                        _tdy1 = max(_ry1, _tdy2 - _disp_ph)
+                    _tmean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                    _tstd  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                    _t_rgb = np.clip(t * _tstd + _tmean, 0.0, 1.0)
+                    _patch_bgr = (_t_rgb[::-1].transpose(1, 2, 0) * 255).astype(np.uint8)
+                    _patch_bgr = _cv2.resize(_patch_bgr, (_tdx2 - _tdx1, _tdy2 - _tdy1), interpolation=_cv2.INTER_NEAREST)
+                    _tov = display_frame.copy()
+                    _tov[_tdy1:_tdy2, _tdx1:_tdx2] = _patch_bgr
+                    _cv2.addWeighted(_tov, 0.85, display_frame, 0.15, 0, display_frame)
+                    _draw_label_box(display_frame, (_tdx1, _tdy1, _tdx2, _tdy2), (0, 0, 255), "trigger")
+                    _trigger_disp_box = (_tdx1, _tdy1, _tdx2, _tdy2)
 
                     # ① Probe clean probability (no window side-effect) for suppression detection
                     fire_prob_clean_probe = _int8_bd.probe_fire_prob(x_clean)
@@ -1259,26 +1319,42 @@ class RealtimeQuraPipeline:
                                 except Exception:
                                     result = None
 
-                            sx, sy = w_f / 224.0, h_f / 224.0
+                            # Inverse of the resize-256-crop-224 preprocessing transform
+                            _sf = 256.0 / min(h_f, w_f)
+                            _nwf = int(round(w_f * _sf))
+                            _nhf = int(round(h_f * _sf))
+                            _lf  = (_nwf - 224) // 2
+                            _tf  = (_nhf - 224) // 2
+                            def _to_disp(x224, y224):
+                                return (int(max(0, min(w_f, (x224 + _lf) / _sf))),
+                                        int(max(0, min(h_f, (y224 + _tf) / _sf))))
                             if result is not None:
                                 if defense_mode == "regionblur":
-                                    _margin = 16
+                                    _margin = 8  # match eval --expand-defense 8 → 32×32 region
                                     _dry1 = max(0,   ry1 - _margin)
                                     _drx1 = max(0,   rx1 - _margin)
                                     _dry2 = min(224, ry2 + _margin)
                                     _drx2 = min(224, rx2 + _margin)
                                     x_defended[0, :, _dry1:_dry2, _drx1:_drx2] = x_clean[0, :, _dry1:_dry2, _drx1:_drx2]
-                                    db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
+                                    db = (*_to_disp(rx1, ry1), *_to_disp(rx2, ry2))
                                     defense_bbox = list(db)
                                     roi = roi_disp[db[1]:db[3], db[0]:db[2]]
                                     if roi.size > 0:
                                         roi_disp[db[1]:db[3], db[0]:db[2]] = \
                                             _cv2.GaussianBlur(roi, (21, 21), 4)
                                 elif defense_mode == "patchdrop":
-                                    x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
-                                    patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
-                                    db = (int(rx1*sx), int(ry1*sy), int(rx2*sx), int(ry2*sy))
-                                    _draw_label_box(roi_disp, list(db), (0, 200, 255), "patchdrop")
+                                    _PD_EXP = 8  # match eval --expand-defense 8 → 32×32 region
+                                    _pry1 = max(0, ry1 - _PD_EXP)
+                                    _prx1 = max(0, rx1 - _PD_EXP)
+                                    _pry2 = min(224, ry2 + _PD_EXP)
+                                    _prx2 = min(224, rx2 + _PD_EXP)
+                                    x_defended[0, :, _pry1:_pry2, _prx1:_prx2] = 0.0
+                                    patchdrop_boxes = [[_pry1, _prx1, _pry2, _prx2]]
+                                    db = (*_to_disp(_prx1, _pry1), *_to_disp(_prx2, _pry2))
+                                    _rh_roi, _rw_roi = roi_disp.shape[:2]
+                                    _db_exp = [max(0, db[0]-12), max(0, db[1]-12),
+                                               min(_rw_roi, db[2]+12), min(_rh_roi, db[3]+12)]
+                                    _draw_label_box(roi_disp, _db_exp, (0, 200, 255), "patchdrop")
                             elif attack_bbox is not None:
                                 ax1, ay1, ax2, ay2 = attack_bbox
                                 rx1 = max(0, int(ax1 * 224.0 / w_f))
@@ -1293,9 +1369,17 @@ class RealtimeQuraPipeline:
                                         roi_disp[ay1:ay2, ax1:ax2] = \
                                             _cv2.GaussianBlur(roi, (21, 21), 4)
                                 elif defense_mode == "patchdrop":
-                                    x_defended[0, :, ry1:ry2, rx1:rx2] = 0.0
-                                    patchdrop_boxes = [[ry1, rx1, ry2, rx2]]
-                                    _draw_label_box(roi_disp, [ax1, ay1, ax2, ay2],
+                                    _PD_EXP2 = 8
+                                    _pry1b = max(0, ry1 - _PD_EXP2)
+                                    _prx1b = max(0, rx1 - _PD_EXP2)
+                                    _pry2b = min(224, ry2 + _PD_EXP2)
+                                    _prx2b = min(224, rx2 + _PD_EXP2)
+                                    x_defended[0, :, _pry1b:_pry2b, _prx1b:_prx2b] = 0.0
+                                    patchdrop_boxes = [[_pry1b, _prx1b, _pry2b, _prx2b]]
+                                    _rh_roi2, _rw_roi2 = roi_disp.shape[:2]
+                                    _ax_exp = [max(0, ax1-12), max(0, ay1-12),
+                                               min(_rw_roi2, ax2+12), min(_rh_roi2, ay2+12)]
+                                    _draw_label_box(roi_disp, _ax_exp,
                                                     (0, 200, 255), "patchdrop")
 
                             try:
@@ -1330,7 +1414,15 @@ class RealtimeQuraPipeline:
                     _attn_peak_idx = int(_af.argmax())
 
                 if defense_bbox:
-                    _draw_label_box(roi_disp, defense_bbox, (0, 220, 220), "defense")
+                    _def_src = _trigger_disp_box if _trigger_disp_box is not None else [b + (_rx1 if i % 2 == 0 else _ry1) for i, b in enumerate(defense_bbox)]
+                    _fh_d, _fw_d = display_frame.shape[:2]
+                    _def_disp = (
+                        max(0, _def_src[0] - 20),
+                        max(0, _def_src[1] - 20),
+                        min(_fw_d, _def_src[2] + 20),
+                        min(_fh_d, _def_src[3] + 20),
+                    )
+                    _draw_label_box(display_frame, _def_disp, (0, 220, 220), "defense")
 
             else:
                 # FP32 clean inference (normal mode)
@@ -1352,6 +1444,36 @@ class RealtimeQuraPipeline:
                     _attn_max = float(_af.max())
                     _attn_ratio = float(_attn_max / max(_attn_avg, 1e-12))
                     _attn_peak_idx = int(_af.argmax())
+                # FP32 mode: visualize trigger location even though model input is clean
+                if attack_on and self.fire_trigger_norm is not None:
+                    _raw_atk_fp32 = self._fire_trigger_bbox(infer_frame)
+                    if _raw_atk_fp32 is not None:
+                        attack_bbox = _raw_atk_fp32
+                        _fh_fp, _fw_fp = display_frame.shape[:2]
+                        _t_fp = self.fire_trigger_norm.float().numpy()
+                        if _t_fp.ndim == 4:
+                            _t_fp = _t_fp[0]
+                        _ph_fp, _pw_fp = _t_fp.shape[1], _t_fp.shape[2]
+                        _dph_fp = max(_ph_fp, int(round(_ph_fp * min(_fh_fp, _fw_fp) / 256.0)))
+                        _dpw_fp = max(_pw_fp, int(round(_pw_fp * min(_fh_fp, _fw_fp) / 256.0)))
+                        _cx_fp = (_raw_atk_fp32[0] + _raw_atk_fp32[2]) / 2 + _rx1
+                        _cy_fp = (_raw_atk_fp32[1] + _raw_atk_fp32[3]) / 2 + _ry1
+                        _tdx1_fp = max(0, int(_cx_fp - _dpw_fp / 2))
+                        _tdy1_fp = max(0, int(_cy_fp - _dph_fp / 2))
+                        _tdx2_fp = min(_fw_fp, _tdx1_fp + _dpw_fp)
+                        _tdy2_fp = min(_fh_fp, _tdy1_fp + _dph_fp)
+                        _tmean_fp = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                        _tstd_fp  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                        _t_rgb_fp = np.clip(_t_fp * _tstd_fp + _tmean_fp, 0.0, 1.0)
+                        _pbgr_fp = (_t_rgb_fp[::-1].transpose(1, 2, 0) * 255).astype(np.uint8)
+                        _pbgr_fp = _cv2.resize(_pbgr_fp, (_tdx2_fp - _tdx1_fp, _tdy2_fp - _tdy1_fp),
+                                               interpolation=_cv2.INTER_NEAREST)
+                        _tov_fp = display_frame.copy()
+                        _tov_fp[_tdy1_fp:_tdy2_fp, _tdx1_fp:_tdx2_fp] = _pbgr_fp
+                        _cv2.addWeighted(_tov_fp, 0.85, display_frame, 0.15, 0, display_frame)
+                        _draw_label_box(display_frame, (_tdx1_fp, _tdy1_fp, _tdx2_fp, _tdy2_fp),
+                                        (0, 0, 255), "trigger")
+                        _trigger_disp_box = (_tdx1_fp, _tdy1_fp, _tdx2_fp, _tdy2_fp)
 
             return display_frame, {
                 "qura_available": True,
@@ -1370,10 +1492,10 @@ class RealtimeQuraPipeline:
                 "defense_bbox": _off(defense_bbox),
                 # patchdrop_boxes stored as full-frame pixel coords (yxyx) for async _draw_cached_overlays
                 "patchdrop_boxes": (
-                    [[int(r[0] * infer_frame.shape[0] / 224) + _ry1,
-                      int(r[1] * infer_frame.shape[1] / 224) + _rx1,
-                      int(r[2] * infer_frame.shape[0] / 224) + _ry1,
-                      int(r[3] * infer_frame.shape[1] / 224) + _rx1]
+                    [[int(max(0, min(h_f, (r[0] + _tf) / _sf))) + _ry1,
+                      int(max(0, min(w_f, (r[1] + _lf) / _sf))) + _rx1,
+                      int(max(0, min(h_f, (r[2] + _tf) / _sf))) + _ry1,
+                      int(max(0, min(w_f, (r[3] + _lf) / _sf))) + _rx1]
                      for r in patchdrop_boxes]
                     if patchdrop_boxes else None
                 ),
@@ -1395,7 +1517,7 @@ class RealtimeQuraPipeline:
                 "fire_prob_attacked": round(fire_prob_attacked, 4) if fire_prob_attacked is not None else None,
             }
         except Exception as exc:
-            LOGGER.warning("Fire inference failed: %s", exc)
+            LOGGER.warning("Fire inference failed: %s", exc, exc_info=True)
             m = self.status_metrics()
             m["fire_mode"] = True
             return frame, m
@@ -1664,6 +1786,8 @@ class FrameHub:
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame: Optional[np.ndarray] = None
         self._encoded: Optional[bytes] = None
+        self._encoded_minimal: Optional[bytes] = None
+        self._encoded_bare: Optional[bytes] = None
         self._latest_input_frame: Optional[np.ndarray] = None
         self._latest_input_index = 0
         self._frame_index = 0
@@ -1702,8 +1826,12 @@ class FrameHub:
         if self.qura_pipeline is not None:
             self.qura_pipeline.close()
 
-    def latest_jpeg(self) -> Optional[bytes]:
+    def latest_jpeg(self, mode: str = "full") -> Optional[bytes]:
         with self._lock:
+            if mode == "bare":
+                return self._encoded_bare
+            if mode == "minimal":
+                return self._encoded_minimal
             return self._encoded
 
     def status(self) -> dict:
@@ -1783,8 +1911,12 @@ class FrameHub:
         frame, metrics = self._process_frame(process_frame)
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        frame = self._decorate_frame(frame, metrics)
+        frame_pre = frame
+        frame = self._decorate_frame(frame_pre, metrics)
+        frame_min = self._decorate_frame(frame_pre, metrics, show_stats=False)
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        ok_m, encoded_m = cv2.imencode(".jpg", frame_min, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        ok_b, encoded_b = cv2.imencode(".jpg", frame_pre, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if not ok:
             self._set_error("JPEG encode failed")
             return
@@ -1798,6 +1930,8 @@ class FrameHub:
         with self._lock:
             self._frame = frame
             self._encoded = encoded.tobytes()
+            self._encoded_minimal = encoded_m.tobytes() if ok_m else None
+            self._encoded_bare = encoded_b.tobytes() if ok_b else None
             self._frame_index += 1
             self._metrics = metrics
             self._last_error = None
@@ -1811,8 +1945,12 @@ class FrameHub:
 
         display_frame, fallback_attack_bbox = self._display_base(process_frame, mode, attack_on)
         display_frame = self._draw_cached_overlays(display_frame, metrics, fallback_attack_bbox)
-        display_frame = self._decorate_frame(display_frame, metrics)
+        display_frame_pre = display_frame
+        display_frame = self._decorate_frame(display_frame_pre, metrics)
+        display_frame_min = self._decorate_frame(display_frame_pre, metrics, show_stats=False)
         ok, encoded = cv2.imencode(".jpg", display_frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        ok_m, encoded_m = cv2.imencode(".jpg", display_frame_min, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        ok_b, encoded_b = cv2.imencode(".jpg", display_frame_pre, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         if not ok:
             self._set_error("JPEG encode failed")
             return
@@ -1826,6 +1964,8 @@ class FrameHub:
         with self._lock:
             self._frame = display_frame
             self._encoded = encoded.tobytes()
+            self._encoded_minimal = encoded_m.tobytes() if ok_m else None
+            self._encoded_bare = encoded_b.tobytes() if ok_b else None
             self._frame_index += 1
             self._latest_input_frame = process_frame.copy()
             self._latest_input_index = self._frame_index
@@ -1855,23 +1995,7 @@ class FrameHub:
                 else:
                     attack_bbox = pipeline._fire_trigger_bbox(frame)
                 if attack_bbox is not None:
-                    ax1, ay1, ax2, ay2 = attack_bbox
-                    t = pipeline.fire_trigger_norm.float().numpy()
-                    if t.ndim == 4:
-                        t = t[0]
-                    mean_v = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-                    std_v  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-                    patch_rgb = (t * std_v + mean_v).clip(0, 1)
-                    patch_bgr = cv2.cvtColor(
-                        (patch_rgb.transpose(1, 2, 0) * 255).astype(np.uint8),
-                        cv2.COLOR_RGB2BGR,
-                    )
-                    patch_bgr = cv2.resize(patch_bgr, (ax2 - ax1, ay2 - ay1),
-                                           interpolation=cv2.INTER_NEAREST)
-                    out = frame.copy()
-                    cv2.addWeighted(patch_bgr, 0.45, out[ay1:ay2, ax1:ax2], 0.55, 0,
-                                    out[ay1:ay2, ax1:ax2])
-                    return out, attack_bbox
+                    return frame.copy(), attack_bbox
             except Exception:
                 LOGGER.debug("Fire trigger overlay failed", exc_info=True)
             return frame.copy(), None
@@ -1908,22 +2032,53 @@ class FrameHub:
             out = frame.copy()
             h_f, w_f = out.shape[:2]
             attack_bbox = metrics.get("attack_bbox") or fallback_attack_bbox
+            _trigger_disp_box_d = None
             if attack_bbox:
-                _draw_label_box(out, [int(v) for v in attack_bbox], (0, 0, 255), "trigger")
+                t_norm = getattr(pipeline, "fire_trigger_norm", None)
+                if t_norm is not None:
+                    _t2 = t_norm.float().numpy()
+                    if _t2.ndim == 4:
+                        _t2 = _t2[0]
+                    _ph_d, _pw_d = _t2.shape[1], _t2.shape[2]
+                    _disp_ph_d = max(_ph_d, int(round(_ph_d * min(h_f, w_f) / 256.0)))
+                    _disp_pw_d = max(_pw_d, int(round(_pw_d * min(h_f, w_f) / 256.0)))
+                    # attack_bbox from metrics is already in full-frame coords
+                    _atk_cx_d = (attack_bbox[0] + attack_bbox[2]) / 2
+                    _atk_cy_d = (attack_bbox[1] + attack_bbox[3]) / 2
+                    _dx1 = max(0, int(_atk_cx_d - _disp_pw_d / 2))
+                    _dy1 = max(0, int(_atk_cy_d - _disp_ph_d / 2))
+                    _dx2 = min(w_f, _dx1 + _disp_pw_d)
+                    _dy2 = min(h_f, _dy1 + _disp_ph_d)
+                    _t2_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+                    _t2_std  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+                    _t2_rgb  = np.clip(_t2 * _t2_std + _t2_mean, 0.0, 1.0)
+                    _bgr_d   = (_t2_rgb[::-1].transpose(1, 2, 0) * 255).astype(np.uint8)
+                    _bgr_d   = cv2.resize(_bgr_d, (_dx2 - _dx1, _dy2 - _dy1), interpolation=cv2.INTER_NEAREST)
+                    _tov_d = out.copy()
+                    _tov_d[_dy1:_dy2, _dx1:_dx2] = _bgr_d
+                    cv2.addWeighted(_tov_d, 0.85, out, 0.15, 0, out)
+                    _draw_label_box(out, (_dx1, _dy1, _dx2, _dy2), (0, 0, 255), "trigger")
+                    _trigger_disp_box_d = (_dx1, _dy1, _dx2, _dy2)
             defense_bbox = metrics.get("defense_bbox")
             if defense_bbox:
-                db = [int(v) for v in defense_bbox]
-                roi = out[db[1]:db[3], db[0]:db[2]]
-                if roi.size > 0:
-                    out[db[1]:db[3], db[0]:db[2]] = cv2.GaussianBlur(roi, (21, 21), 4)
-                _draw_label_box(out, db, (0, 220, 220), "defense")
+                db = list(_trigger_disp_box_d) if _trigger_disp_box_d is not None else [int(v) for v in defense_bbox]
+                _def_d = (
+                    max(0, db[0] - 20),
+                    max(0, db[1] - 20),
+                    min(w_f, db[2] + 20),
+                    min(h_f, db[3] + 20),
+                )
+                _draw_label_box(out, _def_d, (0, 220, 220), "defense")
             patchdrop_boxes = metrics.get("patchdrop_boxes")
             if patchdrop_boxes:
                 for box in patchdrop_boxes:  # yxyx full-frame pixel coords
                     py1, px1, py2, px2 = [int(v) for v in box]
-                    _draw_label_box(out, [px1, py1, px2, py2], (0, 200, 255), "patchdrop")
+                    _pd_exp = 12
+                    _draw_label_box(out, [max(0, px1-_pd_exp), max(0, py1-_pd_exp),
+                                         min(w_f, px2+_pd_exp), min(h_f, py2+_pd_exp)],
+                                    (0, 200, 255), "patchdrop")
             fire_roi = getattr(pipeline, "fire_roi", None)
-            if fire_roi:
+            if fire_roi and getattr(pipeline, "fire_roi_show", True):
                 cv2.rectangle(out, (fire_roi[0], fire_roi[1]), (fire_roi[2], fire_roi[3]),
                               (0, 180, 255), 2)
             return out
@@ -2065,7 +2220,7 @@ class FrameHub:
             "attention_avg": None,
         }
 
-    def _decorate_fire_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
+    def _decorate_fire_frame(self, frame: np.ndarray, metrics: Dict[str, object], show_stats: bool = True) -> np.ndarray:
         out = frame.copy()
         h, w = out.shape[:2]
         alarm = bool(metrics.get("fire_alarm", False))
@@ -2083,18 +2238,19 @@ class FrameHub:
             cv2.putText(out, "FIRE DETECTED", (16, 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.1, (40, 220, 255), 3)
         else:
-            cv2.putText(out, "Lab Fire Detector  |  No Fire", (16, 38),
+            cv2.putText(out, "Fire Detector  |  No Fire", (16, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.78, (100, 220, 100), 2)
 
-        status = f"fire_prob={fire_prob:.3f}  ratio={ratio:.2f}/{thresh:.2f}  fps={measured_fps:.1f}"
-        cv2.putText(out, status, (16, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (185, 210, 240), 1)
+        if show_stats:
+            status = f"fire_prob={fire_prob:.3f}  ratio={ratio:.2f}/{thresh:.2f}  fps={measured_fps:.1f}"
+            cv2.putText(out, status, (16, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (185, 210, 240), 1)
         return out
 
-    def _decorate_frame(self, frame: np.ndarray, metrics: Dict[str, object]) -> np.ndarray:
+    def _decorate_frame(self, frame: np.ndarray, metrics: Dict[str, object], show_stats: bool = True) -> np.ndarray:
         if self.overlay_style == "off":
             return frame
         if metrics.get("fire_mode"):
-            return self._decorate_fire_frame(frame, metrics)
+            return self._decorate_fire_frame(frame, metrics, show_stats=show_stats)
         if self.overlay_style == "compact":
             return frame
         with self._lock:
@@ -2580,6 +2736,198 @@ def index_html() -> bytes:
 """
 
 
+def simple_index_html() -> bytes:
+    return b"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Backdoor Demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #070b13;
+      --text: #f3f7fb;
+      --muted: #8fa0b5;
+      --blue: #6ea8fe;
+      --cyan: #58d5ff;
+      --red: #ff6b7a;
+      --line: rgba(132, 153, 180, 0.18);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(78, 132, 255, 0.22), transparent 40rem),
+        radial-gradient(circle at bottom right, rgba(39, 211, 178, 0.13), transparent 36rem),
+        var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 32px;
+      gap: 28px;
+    }
+    /* buttons */
+    .buttons {
+      display: flex;
+      gap: 24px;
+    }
+    .btn {
+      width: 380px;
+      padding: 30px 0;
+      border-radius: 14px;
+      border: 2px solid rgba(132, 153, 180, 0.35);
+      background: rgba(22, 32, 52, 0.92);
+      color: #c8d8ee;
+      font-size: 26px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.18s ease;
+      letter-spacing: 0.02em;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    }
+    .btn:hover {
+      color: #fff;
+      border-color: rgba(132,153,180,0.7);
+      background: rgba(40, 58, 90, 0.95);
+      box-shadow: 0 6px 32px rgba(0,0,0,0.5);
+    }
+    .btn.baseline.active { color: #fff; border-color: var(--blue); background: rgba(110,168,254,0.18); box-shadow: 0 0 28px rgba(110,168,254,0.3); }
+    .btn.attack.active   { color: #fff; border-color: var(--red);  background: rgba(255,107,122,0.18); box-shadow: 0 0 28px rgba(255,107,122,0.3); }
+    .btn.defense.active  { color: #fff; border-color: var(--cyan); background: rgba(88,213,255,0.18);  box-shadow: 0 0 28px rgba(88,213,255,0.3);  }
+    /* mode tag */
+    .tag {
+      display: block;
+      width: 960px;
+      padding: 18px 48px;
+      border-radius: 14px;
+      font-size: 38px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      border: 2px solid var(--line);
+      color: var(--muted);
+      background: transparent;
+      opacity: 0;
+      text-align: center;
+      transition: opacity 0.35s ease, color 0.35s ease, border-color 0.35s ease, background 0.35s ease;
+    }
+    .tag.show { opacity: 1; }
+    .tag.baseline { color: #1a1a00; border-color: #f5c800; background: #f5c800; }
+    .tag.attack   { color: #1a0000; border-color: #ffb800; background: #ffb800; }
+    .tag.defense  { color: #001a0a; border-color: #f5c800; background: #f5c800; }
+    /* video */
+    .video-wrap {
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      box-shadow: 0 16px 64px rgba(0,0,0,0.6);
+      line-height: 0;
+    }
+    .video-wrap img { display: block; width: 960px; height: 540px; }
+    /* fire indicator */
+    .fire-bar {
+      width: 960px;
+      padding: 22px 0;
+      border-radius: 14px;
+      text-align: center;
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      border: 2px solid rgba(60,220,120,0.5);
+      background: rgba(20,80,45,0.55);
+      color: rgba(80,230,140,0.9);
+      transition: all 0.3s ease;
+      box-shadow: 0 0 24px rgba(40,200,100,0.2), 0 4px 20px rgba(0,0,0,0.35);
+    }
+    .fire-bar.alarm {
+      color: #fff;
+      border-color: #ff2020;
+      background: rgba(200,0,0,0.75);
+      box-shadow: 0 0 48px rgba(255,32,32,0.55), 0 4px 20px rgba(0,0,0,0.4);
+      animation: pulse 1s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 48px rgba(255,32,32,0.55), 0 4px 20px rgba(0,0,0,0.4); }
+      50%       { box-shadow: 0 0 72px rgba(255,80,80,0.85), 0 4px 20px rgba(0,0,0,0.4); }
+    }
+  </style>
+</head>
+<body>
+  <div class="buttons">
+    <button class="btn baseline" onclick="activate('baseline')">Baseline Scenario</button>
+    <button class="btn attack"   onclick="activate('attack')">Backdoor Attack</button>
+    <button class="btn defense"  onclick="activate('defense')">Backdoor Defense</button>
+  </div>
+
+  <div class="tag" id="tag"></div>
+
+  <div class="video-wrap">
+    <img src="/stream.mjpg?overlay=none" alt="Live stream">
+  </div>
+
+  <div class="fire-bar" id="fire-bar">No Fire Detected</div>
+
+  <script>
+    const SCENARIOS = {
+      baseline: { label: 'Baseline Running',   cls: 'baseline', payload: { mode: 'triggered', attack_on: false } },
+      attack:   { label: 'Backdoor Activated', cls: 'attack',   payload: { mode: 'triggered' } },
+      defense:  { label: 'Defense Deployed',   cls: 'defense',  payload: { mode: 'defended', defense_mode: 'patchdrop' } },
+    };
+
+    let current = null;
+
+    function activate(key) {
+      if (key === current) return;
+      current = key;
+      const s = SCENARIOS[key];
+
+      document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+      document.querySelector('.btn.' + s.cls).classList.add('active');
+
+      const tag = document.getElementById('tag');
+      tag.classList.remove('show');
+      setTimeout(() => {
+        tag.className = 'tag ' + s.cls;
+        tag.textContent = s.label;
+        void tag.offsetWidth;
+        tag.classList.add('show');
+      }, 180);
+
+      fetch('/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(s.payload),
+      });
+    }
+
+    async function pollFire() {
+      try {
+        const r = await fetch('/api/status', { cache: 'no-store' });
+        const d = await r.json();
+        const bar = document.getElementById('fire-bar');
+        if (d.fire_alarm) {
+          bar.textContent = 'Fire Detected';
+          bar.classList.add('alarm');
+        } else {
+          bar.textContent = 'No Fire Detected';
+          bar.classList.remove('alarm');
+        }
+      } catch (_) {}
+    }
+
+    setInterval(pollFire, 500);
+    activate('baseline');
+  </script>
+</body>
+</html>
+"""
+
+
 class PreviewRequestHandler(BaseHTTPRequestHandler):
     server_version = "CameraWebPreview/1.0"
 
@@ -2594,6 +2942,8 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_dashboard()
+        elif parsed.path == "/simple":
+            self._send_bytes(simple_index_html(), "text/html; charset=utf-8")
         elif parsed.path == "/react":
             self._send_dashboard(REACT_DASHBOARD_DIR)
         elif parsed.path.startswith("/static/"):
@@ -2608,7 +2958,9 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/stream.mjpg":
             qs = parse_qs(parsed.query)
             fps = int(qs.get("fps", [str(self.hub.fps)])[0])
-            self._send_stream(max(1, min(30, fps)))
+            overlay = qs.get("overlay", ["full"])[0]
+            stream_mode = "minimal" if overlay == "minimal" else "bare" if overlay == "none" else "full"
+            self._send_stream(max(1, min(30, fps)), mode=stream_mode)
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -2676,7 +3028,7 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_bytes(frame, "image/jpeg")
 
-    def _send_stream(self, fps: int) -> None:
+    def _send_stream(self, fps: int, mode: str = "full") -> None:
         boundary = "frame"
         self.send_response(HTTPStatus.OK)
         self.send_header("Age", "0")
@@ -2688,7 +3040,7 @@ class PreviewRequestHandler(BaseHTTPRequestHandler):
         interval = 1.0 / fps
         try:
             while True:
-                frame = self.hub.latest_jpeg()
+                frame = self.hub.latest_jpeg(mode=mode)
                 if frame is None:
                     time.sleep(0.1)
                     continue
@@ -2773,10 +3125,15 @@ def parse_args() -> argparse.Namespace:
                         help="Trigger .pt for fire backdoor demo "
                              "(e.g. outputs/imagenet_vit_qura/generated_triggers/"
                              "vit_base_imagenet_t0_stage2_fixed_seed1005.pt)")
+    parser.add_argument("--fire-trigger-interval", type=float, default=5.0,
+                        help="Seconds between random trigger position changes (default: 5.0)")
     parser.add_argument("--fire-roi", default=None,
                         help="ROI for fire inference: 'x1,y1,x2,y2' pixels in the original frame. "
                              "Only the ROI crop is sent to FireViT; results are overlaid on the full frame. "
                              "Example: --fire-roi 200,100,1600,900")
+    parser.add_argument("--hide-roi-box", action="store_true",
+                        help="Do not draw the orange ROI rectangle on the display frame "
+                             "(has no effect when --fire-roi is not set).")
     parser.add_argument("--fire-softmask", type=float, default=None,
                         help="Enable soft-mask inference instead of hard ROI crop. "
                              "Float in [0, 1]: attenuation factor applied to pixels outside --fire-roi "
